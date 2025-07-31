@@ -88,6 +88,7 @@ class WritableFile : public pstd::noncopyable {
   virtual Status Close() = 0;
   virtual Status Flush() = 0;
   virtual Status Sync() = 0;
+  virtual Status Fsync() { return Sync(); }
   virtual Status Trim(uint64_t offset) = 0;
   virtual uint64_t Filesize() = 0;
 };

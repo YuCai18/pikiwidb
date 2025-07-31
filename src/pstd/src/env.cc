@@ -299,6 +299,7 @@ class PosixMmapFile : public WritableFile {
 
   // Have we done an munmap of unsynced data?
   bool pending_sync_ = false;
+  bool pending_fsync_ = false;
 
   // Roundup x to a multiple of y
   static size_t Roundup(size_t x, size_t y) { return ((x + y - 1) / y) * y; }
@@ -398,7 +399,7 @@ class PosixMmapFile : public WritableFile {
       src += n;
       left -= n;
     }
-    return Status::OK();
+    return this->Fsync();
   }
 
   Status Close() override {
@@ -453,6 +454,31 @@ class PosixMmapFile : public WritableFile {
       }
     }
 
+    return s;
+  }
+
+  Status Fsync() override {
+    Status s;
+
+    if (pending_fsync_) {
+      if (fsync(fd_) < 0) {
+        s = IOError(filename_, errno);
+      }
+    }
+
+    if (dst_ > last_sync_) {
+      // Find the beginnings of the pages that contain the first and last
+      // bytes to be synced.
+      size_t p1 = TruncateToPageBoundary(last_sync_ - base_);
+      size_t p2 = TruncateToPageBoundary(dst_ - base_ - 1);
+      last_sync_ = dst_;
+      if (msync(base_ + p1, p2 - p1 + page_size_, MS_SYNC) < 0) {
+        s = IOError(filename_, errno);
+      }
+    }
+
+    pending_fsync_ = false;
+    pending_sync_ = false;
     return s;
   }
 
