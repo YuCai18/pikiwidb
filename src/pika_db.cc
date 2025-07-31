@@ -240,7 +240,9 @@ void DB::DoBgSave(void* arg) {
                  << g_pika_server->host() << "\n"
                  << g_pika_server->port() << "\n"
                  << info.offset.b_offset.filenum << "\n"
-                 << info.offset.b_offset.offset << "\n";
+                 << info.offset.b_offset.offset << "\n"
+                 << info.offset.l_offset.term << "\n"
+                 << info.offset.l_offset.index << "\n";
     bg_task_arg->db->snapshot_uuid_ = md5(info_content.str());
     out << info_content.rdbuf();
     out.close();
@@ -328,8 +330,7 @@ bool DB::InitBgsaveEngine() {
 
   {
     std::lock_guard lock(dbs_rw_);
-    LogOffset bgsave_offset;
-    // term, index are 0
+    LogOffset bgsave_offset = db->GetCommittedId();
     db->Logger()->GetProducerStatus(&(bgsave_offset.b_offset.filenum), &(bgsave_offset.b_offset.offset));
     {
       std::lock_guard l(bgsave_protector_);
@@ -488,9 +489,9 @@ bool DB::TryUpdateMasterOffset() {
     slave_db->SetReplState(ReplState::kError);
     return false;
   }
-  master_db->Logger()->SetProducerStatus(filenum, offset);
+  master_db->Logger()->SetProducerStatus(filenum, offset, term, index);
   slave_db->SetReplState(ReplState::kTryConnect);
-  LogOffset master_offset(BinlogOffset(filenum,offset),LogicOffset());
+  LogOffset master_offset(BinlogOffset(filenum, offset), LogicOffset(term, index));
   master_db->SetPreparedId(master_offset);
   master_db->SetCommittedId(master_offset);
   LOG(INFO)<<"PacificA write DB finished slave_comitted: "<<master_db->GetCommittedId().ToString()<<" prepared: "<<master_db->GetPreparedId().ToString();

@@ -159,7 +159,7 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
       LOG(WARNING) << "Redis parser failed";
       slave_db->SetReplState(ReplState::kTryConnect);
       return;
-    } 
+    }
     db = g_pika_rm->GetSyncMasterDBByName(DBInfo(worker->db_name_));
     if (!db) {
        LOG(WARNING) << "DB " << worker->db_name_ << " Not Found";

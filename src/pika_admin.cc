@@ -241,7 +241,9 @@ void DbSlaveofCmd::Do() {
         slave_db->State() == ReplState::kDBNoConnect) {
       if (have_offset_) {
         std::shared_ptr<SyncMasterDB> db = g_pika_rm->GetSyncMasterDBByName(DBInfo(db_name_));
-        db->Logger()->SetProducerStatus(filenum_, offset_);
+        // 获取当前逻辑偏移量
+        LogOffset cur_offset = db->GetCommittedId();
+        db->Logger()->SetProducerStatus(filenum_, offset_, cur_offset.l_offset.term, cur_offset.l_offset.index);
       }
       ReplState state = force_sync_ ? ReplState::kTryDBSync : ReplState::kTryConnect;
       s = g_pika_rm->ActivateSyncSlaveDB(

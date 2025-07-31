@@ -25,25 +25,31 @@ struct ReplServerTaskArg {
 
 class PikaReplServer {
  public:
-  PikaReplServer(const std::set<std::string>& ips, int port, int cron_interval);
-  ~PikaReplServer();
+  PikaReplServer(const std::set<std::string>& ips, int port, int cron_interval = 0);
+  virtual ~PikaReplServer();
 
   int Start();
   int Stop();
 
   pstd::Status SendSlaveBinlogChips(const std::string& ip, int port, const std::vector<WriteTask>& tasks);
-  pstd::Status Write(const std::string& ip, int port, const std::string& msg);
-
-  void BuildBinlogOffset(const LogOffset& offset, InnerMessage::BinlogOffset* boffset);
-  void BuildBinlogSyncResp(const std::vector<WriteTask>& tasks, InnerMessage::InnerResponse* resp);
+  
+  // 新增优化的批量发送方法，直接处理ip_port和db_name
+  pstd::Status SendSlaveBinlogChipsRequest(const std::string& ip_port, const std::string& db_name,
+                                   const std::vector<WriteTask>& tasks);
+                                   
   void Schedule(net::TaskFunc func, void* arg);
   void UpdateClientConnMap(const std::string& ip_port, int fd);
   void RemoveClientConn(int fd);
   void KillAllConns();
 
  private:
-  std::unique_ptr<net::ThreadPool> server_tp_ = nullptr;
-  std::unique_ptr<PikaReplServerThread> pika_repl_server_thread_ = nullptr;
+  void BuildBinlogOffset(const LogOffset& offset, InnerMessage::BinlogOffset* boffset);
+  void BuildBinlogSyncResp(const std::vector<WriteTask>& tasks, InnerMessage::InnerResponse* response);
+  pstd::Status Write(const std::string& ip, const int port, const std::string& msg);
+
+  std::unique_ptr<net::ThreadPool> server_tp_;
+  std::unique_ptr<PikaReplServerThread> pika_repl_server_thread_;
+
   std::shared_mutex client_conn_rwlock_;
   std::map<std::string, int> client_conn_map_;
 };

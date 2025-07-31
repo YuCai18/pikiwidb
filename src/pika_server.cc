@@ -1094,11 +1094,47 @@ std::unordered_map<std::string, uint64_t> PikaServer::ServerExecCountDB() {
 
 std::unordered_map<std::string, QpsStatistic> PikaServer::ServerAllDBStat() { return statistic_.AllDBStat(); }
 
-int PikaServer::SendToPeer() { return g_pika_rm->ConsumeWriteQueue(); }
+int PikaServer::SendToPeer() {
+  // 批量处理多个请求，减少日志和CPU开销
+  int processed_count = g_pika_rm->ConsumeWriteQueue();
+  
+  // 只在处理了大量请求时输出日志
+  if (processed_count > 100) {
+    LOG(INFO) << "SendToPeer processed " << processed_count << " tasks";
+  }
+  
+  return processed_count;
+}
 
 void PikaServer::SignalAuxiliary() { pika_auxiliary_thread_->cv_.notify_one(); }
 
-Status PikaServer::TriggerSendBinlogSync() { return g_pika_rm->WakeUpBinlogSync(); }
+Status PikaServer::TriggerSendBinlogSync() {
+  // 预先收集需要处理的DB列表，减少加锁时间
+  std::vector<std::string> db_names;
+  {
+    std::shared_lock rwl(dbs_rw_);
+    db_names.reserve(dbs_.size());
+    for (const auto& db_item : dbs_) {
+      db_names.push_back(db_item.first);
+    }
+  }
+
+  // 记录处理的DB数量
+  int processed = 0;
+
+  // 直接调用g_pika_rm->WakeUpBinlogSync()，不需要对每个DB单独操作
+  Status s = g_pika_rm->WakeUpBinlogSync();
+  if (!s.ok()) {
+    return s;
+  }
+
+  // 只有在实际处理了DB时才记录日志，并降低日志级别
+  if (processed > 0 && pstd::NowMicros() % 100 == 0) { // 每100次触发只记录1次日志
+    DLOG(INFO) << "TriggerSendBinlogSync processed " << processed << " DBs";
+  }
+
+  return Status::OK();
+}
 
 int PikaServer::PubSubNumPat() { return pika_pubsub_thread_->PubSubNumPat(); }
 

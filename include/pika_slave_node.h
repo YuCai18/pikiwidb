@@ -6,6 +6,10 @@
 #ifndef PIKA_SLAVE_NODE_H_
 #define PIKA_SLAVE_NODE_H_
 
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
 #include <deque>
 #include <memory>
 
@@ -14,36 +18,47 @@
 
 struct SyncWinItem {
   LogOffset offset_;
-  std::size_t binlog_size_ = 0;
-  bool acked_ = false;
+  std::size_t binlog_size_{};
+  bool acked_{};
+
+  SyncWinItem() = default;
+
+  explicit SyncWinItem(const LogOffset& offset, std::size_t binlog_size = 0)
+      : offset_(offset), binlog_size_(binlog_size), acked_(false) {}
+
+  SyncWinItem(const SyncWinItem& item) = default;
   bool operator==(const SyncWinItem& other) const {
     return offset_.b_offset.filenum == other.offset_.b_offset.filenum &&
-           offset_.b_offset.offset == other.offset_.b_offset.offset;
+           offset_.b_offset.offset == other.offset_.b_offset.offset &&
+           offset_.l_offset.term == other.offset_.l_offset.term &&
+           offset_.l_offset.index == other.offset_.l_offset.index;
   }
-  explicit SyncWinItem(const LogOffset& offset, std::size_t binlog_size = 0)
-      : offset_(offset), binlog_size_(binlog_size) {}
+  bool operator<(const SyncWinItem& other) const {
+    if (offset_.b_offset.filenum != other.offset_.b_offset.filenum) {
+      return offset_.b_offset.filenum < other.offset_.b_offset.filenum;
+    }
+    return offset_.b_offset.offset < other.offset_.b_offset.offset;
+  }
   std::string ToString() const {
-    return offset_.ToString() + " binglog size: " + std::to_string(binlog_size_) + " acked: " + std::to_string(static_cast<int>(acked_));
+    return "filenum:" + std::to_string(offset_.b_offset.filenum) + 
+           " offset:" + std::to_string(offset_.b_offset.offset) + 
+           " term:" + std::to_string(offset_.l_offset.term) + 
+           " index:" + std::to_string(offset_.l_offset.index) + 
+           " size:" + std::to_string(binlog_size_) + 
+           " acked:" + std::to_string(static_cast<int>(acked_));
   }
 };
 
 class SyncWindow {
  public:
-  SyncWindow()  = default;
+  SyncWindow() = default;
+  ~SyncWindow() = default;
   void Push(const SyncWinItem& item);
   bool Update(const SyncWinItem& start_item, const SyncWinItem& end_item, LogOffset* acked_offset);
   int Remaining();
-  std::string ToStringStatus() const {
-    if (win_.empty()) {
-      return "      Size: " + std::to_string(win_.size()) + "\r\n";
-    } else {
-      std::string res;
-      res += "      Size: " + std::to_string(win_.size()) + "\r\n";
-      res += ("      Begin_item: " + win_.begin()->ToString() + "\r\n");
-      res += ("      End_item: " + win_.rbegin()->ToString() + "\r\n");
-      return res;
-    }
-  }
+
+  std::string ToStringStatus();
+  size_t Size();
   std::size_t GetTotalBinlogSize() { return total_size_; }
   void Reset() {
     win_.clear();
@@ -51,9 +66,12 @@ class SyncWindow {
   }
 
  private:
-  // TODO(whoiami) ring buffer maybe
-  std::deque<SyncWinItem> win_;
-  std::size_t total_size_ = 0;
+  std::string _ToStringStatus();
+  size_t _Size();
+  std::map<LogOffset, SyncWinItem> win_;
+  // std::deque<SyncWinItem> win_;
+  size_t total_size_ = 0;
+  std::mutex win_mu_;
 };
 
 // role master use
@@ -76,8 +94,10 @@ class SlaveNode : public RmNode {
   std::shared_ptr<PikaBinlogReader> binlog_reader;
   pstd::Status InitBinlogFileReader(const std::shared_ptr<Binlog>& binlog, const BinlogOffset& offset);
   pstd::Status Update(const LogOffset& start, const LogOffset& end, LogOffset* updated_offset);
-
-  pstd::Mutex slave_mu;
+  LogOffset SentOffset();
+  void SetSentOffset(const LogOffset& offset);
+  std::mutex slave_mu;
+  std::condition_variable slave_cv;
 };
 
 #endif  // PIKA_SLAVE_NODE_H

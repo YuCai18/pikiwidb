@@ -141,8 +141,8 @@ class Log {
   int FindLogIndex(const LogOffset& offset);
   std::shared_mutex logs_mutex_;
   std::vector<LogItem> logs_;
+  int start_index_ = 0;
   LogOffset last_index_ = LogOffset();
-  LogOffset first_index_ = LogOffset();
 };
 
 class ConsensusCoordinator {

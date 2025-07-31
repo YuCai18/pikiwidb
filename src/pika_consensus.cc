@@ -64,12 +64,14 @@ Status Context::Init() {
 
 void Context::UpdateAppliedIndex(const LogOffset& offset) {
   std::lock_guard l(rwlock_);
-  LogOffset cur_offset;
-  // TODO: 暂时注释掉这一行，因为applied_win_没有push调用，只有update，窗口永远对不上
-  //applied_win_.Update(SyncWinItem(offset), SyncWinItem(offset), &cur_offset);
-  if (cur_offset > applied_index_) {
-    applied_index_ = cur_offset;
+  
+  // 直接更新索引，不再关心是否为边界点
+  if (offset > applied_index_) {
+    applied_index_ = offset;
     StableSave();
+    if (offset.l_offset.index % kBinlogReadWinDefaultSize == 0) {
+      LOG(INFO) << "Passing through window boundary at index " << offset.l_offset.index;
+    }
   }
 }
 
@@ -149,7 +151,7 @@ Status SyncProgress::Update(const std::string& ip, int port, const LogOffset& st
     }
     // update match_index_
     // shared slave_ptr->slave_mu
-    match_index_[ip + std::to_string(port)] = acked_offset;
+    match_index_[MakeSlaveKey(ip, port)] = acked_offset;
   }
 
   return Status::OK();
@@ -343,8 +345,6 @@ Status ConsensusCoordinator::InternalAppendLog(const std::shared_ptr<Cmd>& cmd_p
 Status ConsensusCoordinator::ProcessLeaderLog(const std::shared_ptr<Cmd>& cmd_ptr, const BinlogItem& attribute) {
   LogOffset last_index = mem_logger_->last_offset();
   if (attribute.logic_id() < last_index.l_offset.index) {
-    LOG(WARNING) << DBInfo(db_name_).ToString() << "Drop log from leader logic_id "
-                 << attribute.logic_id() << " cur last index " << last_index.l_offset.index;
     return Status::OK();
   }
 
@@ -357,11 +357,11 @@ Status ConsensusCoordinator::ProcessLeaderLog(const std::shared_ptr<Cmd>& cmd_pt
   } else {
     // this is a flushdb-binlog, both apply binlog and apply db are in sync way
     // ensure all writeDB task that submitted before has finished before we exec this flushdb
-    int32_t wait_ms = 250;
+    int32_t wait_ms = 50;
     while (g_pika_rm->GetUnfinishedAsyncWriteDBTaskCount(db_name_) > 0) {
+      // 使用较短的睡眠时间，避免过长阻塞，但防止CPU空转
       std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-      wait_ms *= 2;
-      wait_ms = wait_ms < 3000 ? wait_ms : 3000;
+      wait_ms = std::min(wait_ms * 2, 250);
     }
     // apply flushdb-binlog in sync way
     Status s = InternalAppendLog(cmd_ptr);
@@ -373,6 +373,13 @@ Status ConsensusCoordinator::ProcessLeaderLog(const std::shared_ptr<Cmd>& cmd_pt
 
 Status ConsensusCoordinator::UpdateSlave(const std::string& ip, int port, const LogOffset& start,
                                          const LogOffset& end) {
+  LogOffset committed_index;
+  Status s = sync_pros_.Update(ip, port, start, end, &committed_index);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // Then, handle the specific state transition for consistency mode.
   if (is_consistency_) {
     std::shared_ptr<SlaveNode> slave_ptr = sync_pros_.GetSlaveNode(ip, port);
     if (!slave_ptr) {
@@ -380,21 +387,11 @@ Status ConsensusCoordinator::UpdateSlave(const std::string& ip, int port, const 
     }
     {
       std::lock_guard l(slave_ptr->slave_mu);
-      slave_ptr->acked_offset = end;
-      sync_pros_.AddMatchIndex(ip, port, slave_ptr->acked_offset);
-      LOG(INFO) << "PacificA slave ip: " << ip << ", port :" << port << ",slave acked_offset "
-                << slave_ptr->acked_offset.ToString();
+      // The acked_offset has been updated inside sync_pros_.Update(),
+      // so we just need to check the state transition condition.
       if (slave_ptr->slave_state != kSlaveBinlogSync && slave_ptr->acked_offset >= slave_ptr->target_offset) {
         slave_ptr->slave_state = kSlaveBinlogSync;
-        LOG(INFO) << "PacificA change slave_state kSlaveBinlogSync acked_offset: " << slave_ptr->acked_offset.ToString()
-                  << ", target_offset: " << slave_ptr->target_offset.ToString();
       }
-    }
-  } else {
-    LogOffset committed_index;
-    Status s = sync_pros_.Update(ip, port, start, end, &committed_index);
-    if (!s.ok()) {
-      return s;
     }
   }
   return Status::OK();
@@ -472,8 +469,7 @@ Status ConsensusCoordinator::TruncateTo(const LogOffset& offset) {
   if (!s.ok()) {
     return s;
   }
-  LOG(INFO) << DBInfo(db_name_).ToString() << " Founded truncate pos "
-            << founded_offset.ToString();  LogOffset committed = committed_index();
+  LogOffset committed = committed_index();
   stable_logger_->Logger()->Lock();
   if (founded_offset.l_offset.index == committed.l_offset.index) {
     mem_logger_->Reset(committed);
@@ -812,12 +808,14 @@ bool ConsensusCoordinator::GetISConsistency() {
 }
 
 bool ConsensusCoordinator::checkFinished(const LogOffset& offset) {
-  //TODO: 暂时加了读写锁，后期考虑替换为原子变量
-  std::lock_guard l(committed_id_rwlock_);
-  if (offset <= committed_id_) {
+  // Use logical index for consensus check, which is more reliable.
+  if (offset.l_offset.index < committed_id_.l_offset.index) {
     return true;
   }
-  return false;
+  if (offset.l_offset.index > committed_id_.l_offset.index) {
+    return false;
+  }
+  return offset.b_offset.offset <= committed_id_.b_offset.offset;
 }
 
 //// pacificA private:
@@ -827,7 +825,6 @@ Status ConsensusCoordinator::PersistAppendBinlog(const std::shared_ptr<Cmd>& cmd
   std::string binlog = std::string();
   LogOffset offset = LogOffset();
   Status s = stable_logger_->Logger()->Put(content, &offset, binlog);
-  LOG(INFO) << "PacificA  binlog_offset :" << offset.ToString();
   cur_offset = offset;
   if (!s.ok()) {
     std::string db_name = cmd_ptr->db_name().empty() ? g_pika_conf->default_db() : cmd_ptr->db_name();
@@ -838,10 +835,14 @@ Status ConsensusCoordinator::PersistAppendBinlog(const std::shared_ptr<Cmd>& cmd
 
     return s;
   }
-  // If successful, append the log entry to the logs
-  // TODO: 这里logs_的appendlog操作和上边的stable_logger_->Logger()->Put不是原子的，可能导致offset大的先被追加到logs_中，
-  // 多线程写入的时候窗口会对不上，最终主从断开连接。需要加逻辑保证原子性
-  logs_->AppendLog(Log::LogItem(cur_offset, cmd_ptr, binlog));
+  
+  // 仅在追加日志时进行短暂加锁，确保追加顺序
+  // Note: Log::AppendLog 内部已有锁保护，但我们需要确保调用顺序
+  {
+    static std::mutex append_mutex;
+    std::lock_guard<std::mutex> lock(append_mutex);
+    logs_->AppendLog(Log::LogItem(cur_offset, cmd_ptr, binlog));
+  }
 
   SetPreparedId(cur_offset);
 
@@ -868,7 +869,7 @@ Status ConsensusCoordinator::AppendEntries(const std::shared_ptr<Cmd>& cmd_ptr, 
 }
 Status ConsensusCoordinator::AppendSlaveEntries(const std::shared_ptr<Cmd>& cmd_ptr, const BinlogItem& attribute) {
   LogOffset last_index = logs_->LastOffset();
-  if (attribute.logic_id() < last_index.l_offset.index) {
+  if (attribute.logic_id() <= last_index.l_offset.index) {
     LOG(WARNING) << DBInfo(db_name_).ToString() << "Drop log from leader logic_id " << attribute.logic_id()
                  << " cur last index " << last_index.l_offset.index;
     return Status::OK();
@@ -885,19 +886,45 @@ Status ConsensusCoordinator::AppendSlaveEntries(const std::shared_ptr<Cmd>& cmd_
  * @brief Commit logs up to the given offset and update the committed ID.
  */
 Status ConsensusCoordinator::CommitAppLog(const LogOffset& master_committed_id) {
-  int index = logs_->FindOffset(logs_->FirstOffset());
+  int index = 0;
   int log_size = logs_->Size();  // Cache log size
+
+  if (index >= log_size) {
+    if (index >= log_size && GetCommittedId() >= logs_->LastOffset()) {
+      logs_->TruncateFrom(logs_->LastOffset());
+    }
+    return Status::OK();
+  }
+
+  std::vector<Log::LogItem> logs_to_apply;
+  const int kMaxBatchApplySize = 1000;
+
   for (int i = index; i < log_size; ++i) {
-    Log::LogItem log = logs_->At(i);
-    if (master_committed_id >= log.offset) {
-      LOG(INFO) << "PacificA master_committed_id: " << master_committed_id.ToString()
-                << ", ApplyLog: " << log.offset.ToString();
-      ApplyBinlog(log.cmd_ptr);
+    if (logs_->At(i).offset <= master_committed_id) {
+      logs_to_apply.push_back(logs_->At(i));
+      if (logs_to_apply.size() >= kMaxBatchApplySize) {
+        break;
+      }
+    } else {
+      break;
     }
   }
 
-  logs_->TruncateFrom(master_committed_id);  // Truncate logs
-  SetCommittedId(master_committed_id);       // Update committed ID
+  if (logs_to_apply.empty()) {
+    if (index >= log_size && GetCommittedId() >= logs_->LastOffset()) {
+      logs_->TruncateFrom(logs_->LastOffset());
+    }
+    return Status::OK();
+  }
+
+  for (const auto& log : logs_to_apply) {
+    ApplyBinlog(log.cmd_ptr);
+  }
+
+  const LogOffset& last_offset = logs_to_apply.back().offset;
+  logs_->TruncateFrom(last_offset);
+  context_->UpdateAppliedIndex(last_offset);
+
   return Status::OK();
 }
 
@@ -922,8 +949,15 @@ Status ConsensusCoordinator::UpdateCommittedID() {
                  << GetCommittedId().ToString() << ")";
     return Status::Error("slave_prepared_id < master_committedId");
   }
+  
+  LogOffset old_committed_id = GetCommittedId();
   SetCommittedId(slave_prepared_id);
-  LOG(INFO) << "PacificA update CommittedID: " << GetCommittedId().ToString();
+  
+  // 如果提交ID更新了，通知等待的线程
+  if (slave_prepared_id > old_committed_id && g_pika_rm) {
+    g_pika_rm->GetSyncMasterDBByName(DBInfo(db_name_))->ConsensusUpdate(slave_prepared_id);
+    CommitAppLog(slave_prepared_id);
+  }
   return Status::OK();
 }
 Status ConsensusCoordinator::ProcessCoordination() {
@@ -931,10 +965,10 @@ Status ConsensusCoordinator::ProcessCoordination() {
   Status s = stable_logger_->Logger()->GetProducerStatus(&(offset.b_offset.filenum), &(offset.b_offset.offset),
                                                          &(offset.l_offset.term), &(offset.l_offset.index));
   LogOffset stable_committed_id = context_->applied_index_;
-  if (stable_committed_id == LogOffset() || stable_committed_id.l_offset.index + 10 < offset.l_offset.index) {
-    SetCommittedId(offset);
-  } else {
+  if (stable_committed_id.l_offset.index > offset.l_offset.index) {
     SetCommittedId(stable_committed_id);
+  } else {
+    SetCommittedId(offset);
   }
   SetPreparedId(offset);
   if (g_pika_server->role() & PIKA_ROLE_MASTER && g_pika_server->last_role() & PIKA_ROLE_SLAVE) {
@@ -953,10 +987,9 @@ Status ConsensusCoordinator::ApplyBinlog(const std::shared_ptr<Cmd>& cmd_ptr) {
   } else {
     int32_t wait_ms = 250;
     while (g_pika_rm->GetUnfinishedAsyncWriteDBTaskCount(db_name_) > 0) {
-      // TODO: 暂时去掉了sleep的逻辑，考虑使用条件变量唤醒
-      //std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-      wait_ms *= 2;
-      wait_ms = wait_ms < 3000 ? wait_ms : 3000;
+      // 添加短暂睡眠，避免CPU空转，最大不超过250ms
+      std::this_thread::sleep_for(std::chrono::milliseconds(std::min(wait_ms, 50)));
+      wait_ms = std::min(wait_ms * 2, 250);
     }
     PikaReplBgWorker::WriteDBInSyncWay(cmd_ptr);
   }
@@ -1013,7 +1046,7 @@ Log::Log() = default;
 
 int Log::Size() {
   std::shared_lock lock(logs_mutex_);
-  return static_cast<int>(logs_.size());
+  return static_cast<int>(logs_.size()) - start_index_;
 }
 
 void Log::AppendLog(const LogItem& item) {
@@ -1029,22 +1062,49 @@ LogOffset Log::LastOffset() {
 
 LogOffset Log::FirstOffset() {
   std::shared_lock lock(logs_mutex_);
-  return first_index_;
+  if (Size() == 0) {
+    return LogOffset();
+  }
+  return logs_[start_index_].offset;
 }
 
 Log::LogItem Log::At(int index) {
   std::shared_lock lock(logs_mutex_);
-  return logs_.at(index);  // 使用 at() 确保边界安全
+  return logs_.at(index + start_index_);
 }
 
 int Log::FindOffset(const LogOffset& send_offset) {
   std::shared_lock lock(logs_mutex_);
-  for (size_t i = 0; i < logs_.size(); ++i) {
-    if (logs_[i].offset > send_offset) {
-      return i;
+  if (Size() == 0) {
+    return 0;
+  }
+  // 使用 start_index_ 来获取逻辑上的第一个元素
+  if (send_offset < logs_[start_index_].offset) {
+    return 0;
+  }
+
+  // 如果要查找的偏移量大于等于最后一个日志条目，直接返回日志大小
+  if (send_offset >= logs_.back().offset) {
+    return static_cast<int>(logs_.size()) - start_index_;
+  }
+  
+  // 二分查找
+  int left = start_index_;
+  int right = static_cast<int>(logs_.size()) - 1;
+  
+  while (left <= right) {
+    int mid = left + (right - left) / 2;
+    
+    if (logs_[mid].offset <= send_offset && (mid + 1 >= static_cast<int>(logs_.size()) || logs_[mid + 1].offset > send_offset)) {
+      return mid + 1 - start_index_;
+    } else if (logs_[mid].offset <= send_offset) {
+      left = mid + 1;
+    } else {
+      right = mid - 1;
     }
   }
-  return static_cast<int>(logs_.size());
+  
+  return left - start_index_;
 }
 
 Status Log::Truncate(const LogOffset& offset) {
@@ -1064,15 +1124,32 @@ Status Log::TruncateFrom(const LogOffset& offset) {
   if (index < 0) {
     return Status::Corruption("Can't find correct index");
   }
-  first_index_ = logs_[index].offset;
-  logs_.erase(logs_.begin(), logs_.begin() + index);
+  start_index_ = index + 1;
   return Status::OK();
 }
 
 int Log::FindLogIndex(const LogOffset& offset) {
-  for (size_t i = 0; i < logs_.size(); ++i) {
-    if (logs_[i].offset == offset) {
-      return static_cast<int>(i);
+  if (logs_.empty() || start_index_ >= static_cast<int>(logs_.size())) {
+    return -1;
+  }
+  
+  if (offset < logs_[start_index_].offset || offset > logs_.back().offset) {
+    return -1;
+  }
+  
+  // 二分查找
+  int left = start_index_;
+  int right = static_cast<int>(logs_.size()) - 1;
+  
+  while (left <= right) {
+    int mid = left + (right - left) / 2;
+    
+    if (logs_[mid].offset == offset) {
+      return mid;
+    } else if (logs_[mid].offset < offset) {
+      left = mid + 1;
+    } else {
+      right = mid - 1;
     }
   }
   return -1;

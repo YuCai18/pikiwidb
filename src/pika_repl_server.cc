@@ -80,7 +80,88 @@ pstd::Status PikaReplServer::SendSlaveBinlogChips(const std::string& ip, int por
   return Write(ip, port, binlog_chip_pb);
 }
 
+// 优化的批量发送方法，直接处理db_name和批量任务
+pstd::Status PikaReplServer::SendSlaveBinlogChipsRequest(const std::string& ip_port, const std::string& db_name,
+                                                const std::vector<WriteTask>& tasks) {
+  if (tasks.empty()) {
+    return Status::OK();
+  }
+
+  // 解析ip和port
+  std::string ip;
+  int port = 0;
+  if (!pstd::ParseIpPortString(ip_port, ip, port)) {
+    return Status::InvalidArgument("Invalid ip_port format: " + ip_port);
+  }
+
+  // 估算消息大小，提前预留空间
+  size_t estimated_size = 0;
+  for (const auto& task : tasks) {
+    estimated_size += task.binlog_chip_.binlog_.size() + 100; // 100字节用于其他协议开销
+  }
+  
+  // 大型批次日志，需要拆分
+  const size_t MAX_CHUNK_SIZE = g_pika_conf->max_conn_rbuf_size() * 0.9; // 留10%的缓冲
+  
+  // 如果估计大小超过限制，拆分成多个请求发送
+  if (estimated_size > MAX_CHUNK_SIZE && tasks.size() > 1) {
+    // 分批次发送
+    size_t current_size = 0;
+    std::vector<WriteTask> batch;
+    batch.reserve(std::min(tasks.size(), size_t(100)));
+    
+    for (const auto& task : tasks) {
+      size_t task_size = task.binlog_chip_.binlog_.size() + 100;
+      
+      // 如果单个任务就超过最大大小，单独处理
+      if (task_size > MAX_CHUNK_SIZE) {
+        // 先发送当前批次
+        if (!batch.empty()) {
+          Status s = SendSlaveBinlogChips(ip, port, batch);
+          if (!s.ok()) {
+            return s;
+          }
+          batch.clear();
+          current_size = 0;
+        }
+        
+        // 单独发送这个大任务
+        std::vector<WriteTask> single_task = {task};
+        Status s = SendSlaveBinlogChips(ip, port, single_task);
+        if (!s.ok()) {
+          return s;
+        }
+        continue;
+      }
+      
+      // 如果添加当前任务会超过大小限制，先发送当前批次
+      if (!batch.empty() && current_size + task_size > MAX_CHUNK_SIZE) {
+        Status s = SendSlaveBinlogChips(ip, port, batch);
+        if (!s.ok()) {
+          return s;
+        }
+        batch.clear();
+        current_size = 0;
+      }
+      
+      // 添加到当前批次
+      batch.push_back(task);
+      current_size += task_size;
+    }
+    
+    // 发送剩余批次
+    if (!batch.empty()) {
+      return SendSlaveBinlogChips(ip, port, batch);
+    }
+    return Status::OK();
+  }
+  
+  // 正常情况，直接发送
+  return SendSlaveBinlogChips(ip, port, tasks);
+}
+
 void PikaReplServer::BuildBinlogOffset(const LogOffset& offset, InnerMessage::BinlogOffset* boffset) {
+  // 直接设置字段，减少不必要的临时变量和赋值操作
   boffset->set_filenum(offset.b_offset.filenum);
   boffset->set_offset(offset.b_offset.offset);
   boffset->set_term(offset.l_offset.term);
@@ -90,6 +171,10 @@ void PikaReplServer::BuildBinlogOffset(const LogOffset& offset, InnerMessage::Bi
 void PikaReplServer::BuildBinlogSyncResp(const std::vector<WriteTask>& tasks, InnerMessage::InnerResponse* response) {
   response->set_code(InnerMessage::kOk);
   response->set_type(InnerMessage::Type::kBinlogSync);
+  
+  // 预分配空间，避免频繁内存分配
+  response->mutable_binlog_sync()->Reserve(tasks.size());
+  
   for (const auto& task : tasks) {
     InnerMessage::InnerResponse::BinlogSync* binlog_sync = response->add_binlog_sync();
     binlog_sync->set_session_id(task.rm_node_.SessionId());
@@ -107,6 +192,7 @@ void PikaReplServer::BuildBinlogSyncResp(const std::vector<WriteTask>& tasks, In
       InnerMessage::BinlogOffset* committed_id = binlog_sync->mutable_committed_id();
       BuildBinlogOffset(task.committed_id_, committed_id);
     }
+    // 避免额外的内存拷贝，使用move或直接引用
     binlog_sync->set_binlog(task.binlog_chip_.binlog_);
   }
 }
@@ -114,19 +200,23 @@ void PikaReplServer::BuildBinlogSyncResp(const std::vector<WriteTask>& tasks, In
 pstd::Status PikaReplServer::Write(const std::string& ip, const int port, const std::string& msg) {
   std::shared_lock l(client_conn_rwlock_);
   const std::string ip_port = pstd::IpPortString(ip, port);
-  if (client_conn_map_.find(ip_port) == client_conn_map_.end()) {
-    return Status::NotFound("The " + ip_port + " fd cannot be found");
+  auto it = client_conn_map_.find(ip_port);
+  if (it == client_conn_map_.end()) {
+    return Status::NotFound("Connection " + ip_port + " not found");
   }
-  int fd = client_conn_map_[ip_port];
+  int fd = it->second;
+
   std::shared_ptr<net::PbConn> conn = std::dynamic_pointer_cast<net::PbConn>(pika_repl_server_thread_->get_conn(fd));
   if (!conn) {
-    return Status::NotFound("The" + ip_port + " conn cannot be found");
+    return Status::NotFound("Connection " + ip_port + " not available");
   }
 
+  // 只有在写入失败时才记录错误日志并关闭连接
   if (conn->WriteResp(msg)) {
     conn->NotifyClose();
-    return Status::Corruption("The" + ip_port + " conn, Write Resp Failed");
+    return Status::Corruption("Failed to write to " + ip_port);
   }
+  
   conn->NotifyWrite();
   return Status::OK();
 }

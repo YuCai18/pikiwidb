@@ -23,8 +23,9 @@
 
 using pstd::Status;
 
-extern std::unique_ptr<PikaReplicaManager> g_pika_rm;
+extern std::unique_ptr<PikaConf> g_pika_conf;
 extern PikaServer* g_pika_server;
+extern std::unique_ptr<PikaReplicaManager> g_pika_rm;
 
 /* SyncDB */
 
@@ -229,33 +230,43 @@ Status SyncMasterDB::GetSlaveState(const std::string& ip, int port, SlaveState* 
 }
 
 Status SyncMasterDB::WakeUpSlaveBinlogSync() {
-    std::unordered_map<std::string, std::shared_ptr<SlaveNode>> slaves = GetAllSlaveNodes();
-    std::vector<std::shared_ptr<SlaveNode>> to_del;
-    for (auto& slave_iter : slaves) {
-        std::shared_ptr<SlaveNode> slave_ptr = slave_iter.second;
-        std::lock_guard l(slave_ptr->slave_mu);
-        if (slave_ptr->sent_offset == slave_ptr->acked_offset) {
-          Status s;
-          if (coordinator_.GetISConsistency()) {
-            if(slave_ptr->slave_state == SlaveState::kSlaveBinlogSync||slave_ptr->slave_state == SlaveState::KCandidate){
-              s = coordinator_.SendBinlog(slave_ptr, db_info_.db_name_);
+    std::vector<std::shared_ptr<SlaveNode>> slaves_to_process;
+    {
+        auto slaves = GetAllSlaveNodes();
+        slaves_to_process.reserve(slaves.size());
+        
+        // 先筛选出需要处理的slave节点
+        for (auto& slave_iter : slaves) {
+            std::shared_ptr<SlaveNode> slave_ptr = slave_iter.second;
+            if (slave_ptr->slave_state == SlaveState::kSlaveBinlogSync || 
+                slave_ptr->slave_state == SlaveState::KCandidate) {
+                slaves_to_process.push_back(slave_ptr);
             }
-          } else {
-            s = ReadBinlogFileToWq(slave_ptr);
-          }
-          if (!s.ok()) {
-            to_del.push_back(slave_ptr);
-            LOG(WARNING) << "WakeUpSlaveBinlogSync failed, marking for deletion: "
-                             << slave_ptr->ToStringStatus() << " - " << s.ToString();
-          }
         }
     }
-
-    for (const auto& to_del_slave : to_del) {
-        RemoveSlaveNode(to_del_slave->Ip(), to_del_slave->Port());
-        LOG(INFO) << "Removed slave: " << to_del_slave->ToStringStatus();
+    
+    // 不需要加锁的部分集中处理
+    for (auto& slave_ptr : slaves_to_process) {
+        std::string ip_port = slave_ptr->Ip() + ":" + std::to_string(slave_ptr->Port());
+        bool need_sync = false;
+        
+        // 使用小粒度锁减少锁竞争
+        {
+            std::lock_guard l(slave_ptr->slave_mu);
+            if (slave_ptr->sent_offset == slave_ptr->acked_offset) {
+                need_sync = true;
+            }
+        }
+        
+        if (need_sync) {
+            // 只在必要时读取文件，减少IO操作
+            Status s = ReadBinlogFileToWq(slave_ptr);
+            if (!s.ok() && !s.IsEndFile()) {
+                LOG(WARNING) << "binlog sync error: " << s.ToString();
+            }
+        }
     }
-
+    
     return Status::OK();
 }
 
@@ -338,9 +349,9 @@ Status SyncMasterDB::CheckSyncTimeout(uint64_t now) {
                slave_ptr->sent_offset == slave_ptr->acked_offset) {
       std::vector<WriteTask> task;
       RmNode rm_node(slave_ptr->Ip(), slave_ptr->Port(), slave_ptr->DBName(), slave_ptr->SessionId());
-      WriteTask empty_task(rm_node, BinlogChip(LogOffset(), ""), LogOffset());
+      WriteTask empty_task(rm_node, BinlogChip(slave_ptr->acked_offset, ""), LogOffset());
       if(GetISConsistency()){
-        empty_task = WriteTask(rm_node, BinlogChip(LogOffset(), ""), LogOffset(),GetCommittedId());
+        empty_task = WriteTask(rm_node, BinlogChip(slave_ptr->acked_offset, ""), LogOffset(),GetCommittedId());
       }
       task.push_back(empty_task);
       Status s = g_pika_rm->SendSlaveBinlogChipsRequest(slave_ptr->Ip(), slave_ptr->Port(), task);
@@ -472,32 +483,43 @@ Status SyncMasterDB::AppendCandidateBinlog(const std::string& ip, int port, cons
 }
 
 Status SyncMasterDB::ConsensusProposeLog(const std::shared_ptr<Cmd>& cmd_ptr) {
-    // If consistency is not required, directly propose the log without waiting for consensus
-    if (!coordinator_.GetISConsistency()) {
-        return coordinator_.ProposeLog(cmd_ptr);
-    }
+  // If consistency is not required, directly propose the log without waiting for consensus
+  if (!coordinator_.GetISConsistency()) {
+    return coordinator_.ProposeLog(cmd_ptr);
+  }
 
-    auto start = std::chrono::steady_clock::now();
-    LogOffset offset;
-    Status s = coordinator_.AppendEntries(cmd_ptr, offset); // Append the log entry to the coordinator
+  LogOffset offset;
+  Status s = coordinator_.AppendEntries(cmd_ptr, offset); // Append the log entry to the coordinator
 
-    if (!s.ok()) {
-        return s;
-    }
+  if (!s.ok()) {
+    return s;
+  }
 
-    // Wait for consensus to be achieved within 10 seconds
-    while (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() < 10) {
-        // Check if consensus has been achieved for the given log offset
-        if (checkFinished(offset)) {
-            return Status::OK();
-        }
-        // TODO: 这里暂时注掉了sleep等待，50ms耗时过长，影响写入链路，后期需要改成条件变量唤醒方式
-        //std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+  if (checkFinished(offset)) {
+    return Status::OK();
+  }
 
-    return Status::Timeout("No consistency achieved within 10 seconds");
+  const int MAX_RETRIES = 2;
+  const auto WAIT_TIME = std::chrono::milliseconds(1500);
+
+  // Use a lock on the slave_mu to wait on the condition variable
+  std::shared_ptr<SlaveNode> slave_ptr = GetAllSlaveNodes().begin()->second;
+  std::unique_lock<std::mutex> lock(slave_ptr->slave_mu);
+  if (slave_ptr->slave_cv.wait_for(lock, WAIT_TIME, 
+                                      [this, &offset] { return checkFinished(offset); })) {
+    return Status::OK();
+  }
+  return Status::Timeout("Timeout waiting for consensus");
 }
 
+void SyncMasterDB::ConsensusUpdate(const LogOffset& offset) {
+  if (checkFinished(offset)) {
+    // Notify all waiting threads
+    for (auto& iter : GetAllSlaveNodes()) {
+      iter.second->slave_cv.notify_all();
+    }
+  }
+}
 
 Status SyncMasterDB::ConsensusProcessLeaderLog(const std::shared_ptr<Cmd>& cmd_ptr, const BinlogItem& attribute) {
   return coordinator_.ProcessLeaderLog(cmd_ptr, attribute);

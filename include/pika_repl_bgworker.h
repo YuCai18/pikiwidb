@@ -22,6 +22,7 @@
 class PikaReplBgWorker {
  public:
   explicit PikaReplBgWorker(int queue_size);
+  ~PikaReplBgWorker() = default;
   int StartThread();
   int StopThread();
   int TaskQueueSize() {
@@ -42,6 +43,7 @@ class PikaReplBgWorker {
   net::RedisParser redis_parser_;
   std::string ip_port_;
   std::string db_name_;
+  bool force_sync_ = false;
 
  private:
   net::BGThread bg_thread_;

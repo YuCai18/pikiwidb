@@ -134,15 +134,50 @@ struct LogOffset {
     l_offset = _log_offset.l_offset;
   }
   LogOffset() = default;
-  LogOffset(const BinlogOffset& _b_offset, const LogicOffset& _l_offset) : b_offset(_b_offset), l_offset(_l_offset) {}
-  bool operator<(const LogOffset& other) const { return b_offset < other.b_offset; }
-  bool operator==(const LogOffset& other) const { return b_offset == other.b_offset; }
-  bool operator<=(const LogOffset& other) const { return b_offset <= other.b_offset; }
-  bool operator>=(const LogOffset& other) const { return b_offset >= other.b_offset; }
-  bool operator>(const LogOffset& other) const { return b_offset > other.b_offset; }
-  std::string ToString() const { return b_offset.ToString() + " " + l_offset.ToString(); }
   BinlogOffset b_offset;
   LogicOffset l_offset;
+  LogOffset(const BinlogOffset& _b_offset, const LogicOffset& _l_offset) : b_offset(_b_offset), l_offset(_l_offset) {}
+  bool operator<(const LogOffset& other) const { return b_offset < other.b_offset; }
+  bool operator==(const LogOffset& other) const { 
+    return b_offset == other.b_offset && 
+           l_offset.term == other.l_offset.term && 
+           l_offset.index == other.l_offset.index; 
+  }
+  bool operator<=(const LogOffset& other) const { 
+    if (b_offset < other.b_offset) return true;
+    if (other.b_offset < b_offset) return false;
+    // b_offset相等时，比较l_offset
+    if (l_offset.term < other.l_offset.term) return true;
+    if (other.l_offset.term < l_offset.term) return false;
+    // term相等时，比较index
+    return l_offset.index <= other.l_offset.index;
+  }
+  bool operator>=(const LogOffset& other) const { 
+    if (b_offset > other.b_offset) return true;
+    if (other.b_offset > b_offset) return false;
+    // b_offset相等时，比较l_offset
+    if (l_offset.term > other.l_offset.term) return true;
+    if (other.l_offset.term > l_offset.term) return false;
+    // term相等时，比较index
+    return l_offset.index >= other.l_offset.index;
+  }
+  bool operator>(const LogOffset& other) const { 
+    if (b_offset > other.b_offset) return true;
+    if (other.b_offset > b_offset) return false;
+    // b_offset相等时，比较l_offset
+    if (l_offset.term > other.l_offset.term) return true;
+    if (other.l_offset.term > l_offset.term) return false;
+    // term相等时，比较index
+    return l_offset.index > other.l_offset.index;
+  }
+  bool operator!=(const LogOffset& other) const {
+    return !(*this == other);
+  }
+
+  std::string ToString() const {
+    return "filenum:" + std::to_string(b_offset.filenum) + " offset:" + std::to_string(b_offset.offset) +
+           " term:" + std::to_string(l_offset.term) + " index:" + std::to_string(l_offset.index);
+  }
 };
 
 // dbsync arg

@@ -350,6 +350,17 @@ class PikaConf : public pstd::BaseConf {
   int max_conn_rbuf_size() { return max_conn_rbuf_size_.load(); }
   int consensus_level() { return consensus_level_.load(); }
   int replication_num() { return replication_num_.load(); }
+  
+  // 批处理大小参数，控制一次批量处理的最大大小
+  size_t binlog_batch_size() { return binlog_batch_size_; }
+  
+  // 批处理数量参数，控制一次批量处理的最大条目数
+  int binlog_batch_num() { return binlog_batch_num_; }
+  
+  // 日志输出控制，超过多少条或多少字节时输出日志
+  int binlog_log_threshold_num() { return binlog_log_threshold_num_; }
+  size_t binlog_log_threshold_size() { return binlog_log_threshold_size_; }
+  
   int rate_limiter_mode() {
     std::shared_lock l(rwlock_);
     return rate_limiter_mode_;
@@ -1006,6 +1017,12 @@ class PikaConf : public pstd::BaseConf {
   int target_file_size_base_ = 0;
   int64_t max_compaction_bytes_ = 0;
   int binlog_file_size_ = 0;
+
+  // 批处理大小参数，控制一次批量处理的最大大小
+  size_t binlog_batch_size_ = 8 * 1024 * 1024; // 默认8MB
+  int binlog_batch_num_ = 200; // 默认200条
+  int binlog_log_threshold_num_ = 50; // 默认50条日志时输出
+  size_t binlog_log_threshold_size_ = 1024 * 1024; // 默认1MB数据时输出
 
   // cache
   std::vector<std::string> cache_type_;

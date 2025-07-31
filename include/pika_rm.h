@@ -12,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <condition_variable>
 
 #include "pstd/include/pstd_status.h"
 
@@ -23,8 +24,8 @@
 #include "include/pika_stable_log.h"
 #include "include/rsync_client.h"
 
-#define kBinlogSendPacketNum 40
-#define kBinlogSendBatchNum 100
+#define kBinlogSendPacketNum 80
+#define kBinlogSendBatchNum 300
 
 // unit seconds
 #define kSendKeepAliveTimeout (2 * 1000000)
@@ -68,6 +69,7 @@ class SyncMasterDB : public SyncDB {
 
   // consensus use
   pstd::Status ConsensusUpdateSlave(const std::string& ip, int port, const LogOffset& start, const LogOffset& end);
+  void ConsensusUpdate(const LogOffset& offset);
   pstd::Status ConsensusProposeLog(const std::shared_ptr<Cmd>& cmd_ptr);
   pstd::Status ConsensusProcessLeaderLog(const std::shared_ptr<Cmd>& cmd_ptr, const BinlogItem& attribute);
   LogOffset ConsensusCommittedIndex();
@@ -113,7 +115,9 @@ class SyncMasterDB : public SyncDB {
   pstd::Status CommitAppLog(const LogOffset& master_committed_id);
   pstd::Status Truncate(const LogOffset& offset);
 
-
+ private:
+  pstd::Mutex commit_mu_;
+  pstd::CondVar commit_cond_;
 };
 
 class SyncSlaveDB : public SyncDB {
