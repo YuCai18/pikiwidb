@@ -350,6 +350,18 @@ class PikaConf : public pstd::BaseConf {
   int max_conn_rbuf_size() { return max_conn_rbuf_size_.load(); }
   int consensus_level() { return consensus_level_.load(); }
   int replication_num() { return replication_num_.load(); }
+  int consensus_batch_size() {
+    std::shared_lock l(rwlock_);
+    return consensus_batch_size_;
+  }
+  int consensus_timeout() {
+    std::shared_lock l(rwlock_);
+    return consensus_timeout_;
+  }
+  int replication_ack_timeout() {
+    std::shared_lock l(rwlock_);
+    return replication_ack_timeout_;
+  }
   int rate_limiter_mode() {
     std::shared_lock l(rwlock_);
     return rate_limiter_mode_;
@@ -665,6 +677,21 @@ class PikaConf : public pstd::BaseConf {
     TryPushDiffCommands("max-conn-rbuf-size", std::to_string(value));
     max_conn_rbuf_size_.store(value);
   }
+  void SetConsensusBatchSize(const int value) {
+    std::lock_guard l(rwlock_);
+    TryPushDiffCommands("consensus-batch-size", std::to_string(value));
+    consensus_batch_size_ = value;
+  }
+  void SetConsensusTimeout(const int value) {
+    std::lock_guard l(rwlock_);
+    TryPushDiffCommands("consensus-timeout", std::to_string(value));
+    consensus_timeout_ = value;
+  }
+  void SetReplicationAckTimeout(const int value) {
+    std::lock_guard l(rwlock_);
+    TryPushDiffCommands("replication-ack-timeout", std::to_string(value));
+    replication_ack_timeout_ = value;
+  }
   void SetMaxCacheFiles(const int& value) {
     std::lock_guard l(rwlock_);
     TryPushDiffCommands("max-cache-files", std::to_string(value));
@@ -747,6 +774,12 @@ class PikaConf : public pstd::BaseConf {
     std::lock_guard l(rwlock_);
     TryPushDiffCommands("rsync-timeout-ms", std::to_string(value));
     rsync_timeout_ms_.store(value);
+  }
+ 
+  void SetBinlogFsyncSize(const int value) {
+    std::lock_guard l(rwlock_);
+    TryPushDiffCommands("binlog-fsync-size", std::to_string(value));
+    binlog_fsync_size_ = value;
   }
 
   void SetProtoMaxBulkLen(const int64_t value) {
@@ -888,9 +921,6 @@ class PikaConf : public pstd::BaseConf {
   int ConfigRewriteSlaveOf();
   int ConfigRewriteReplicationID();
 
-  int consensus_batch_size() const;
-  int consensus_timeout() const;
-
  private:
   int port_ = 0;
   int slave_priority_ = 100;
@@ -982,11 +1012,14 @@ class PikaConf : public pstd::BaseConf {
   int64_t rate_limiter_refill_period_us_ = 0;
   int64_t rate_limiter_fairness_ = 0;
   bool rate_limiter_auto_tuned_ = true;
+  int replication_ack_timeout_ = 5000;
 
   std::atomic<int> sync_window_size_;
   std::atomic<int> max_conn_rbuf_size_;
   std::atomic<int> consensus_level_;
   std::atomic<int> replication_num_;
+  int consensus_batch_size_ = 1000;
+  int consensus_timeout_ = 1500;
 
   std::string network_interface_;
 
@@ -1050,6 +1083,7 @@ class PikaConf : public pstd::BaseConf {
   int throttle_bytes_per_second_ = 200 << 20; // 200MB/s
   int max_rsync_parallel_num_ = kMaxRsyncParallelNum;
   std::atomic_int64_t rsync_timeout_ms_ = 1000;
+  int binlog_fsync_size_ = 8 * 1024 * 1024;
 
   /*
   kUninitialized = 0,             // unknown setting
@@ -1068,10 +1102,6 @@ class PikaConf : public pstd::BaseConf {
 
   //Internal used metrics Persisted by pika.conf
   std::unordered_set<std::string> internal_used_unfinished_full_sync_;
-
-  // Consensus configuration
-  int consensus_batch_size_;
-  int consensus_timeout_;
 };
 
 #endif

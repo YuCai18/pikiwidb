@@ -54,7 +54,7 @@ sleep 1
 
 # 执行 benchmark
 echo "Running benchmark..."
-redis-benchmark -p 9301 -t set -n 100000 -c 20 --threads 20
+redis-benchmark -p 9301 -t set -n 100000 -c 500 --threads 20
 echo "Benchmark finished." 
 
 # 打印日志信息

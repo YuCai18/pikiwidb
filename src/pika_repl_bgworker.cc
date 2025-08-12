@@ -58,8 +58,8 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
   PikaReplBgWorker* worker = task_arg->worker;
   worker->ip_port_ = conn->ip_port();
 
-  LOG(INFO) << "HandleBGWorkerWriteBinlog: Received binlog from master " << worker->ip_port_ 
-            << ", index size: " << index->size();
+  // LOG(INFO) << "HandleBGWorkerWriteBinlog: Received binlog from master " << worker->ip_port_ 
+  //           << ", index size: " << index->size();
 
   DEFER { 
     delete index;
@@ -147,7 +147,7 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
     if(db->GetISConsistency()){
       const InnerMessage::BinlogOffset& committed_id = binlog_res.committed_id();
       LogOffset master_committed_id(BinlogOffset(committed_id.filenum(),committed_id.offset()),LogicOffset(committed_id.term(),committed_id.index()));
-      LOG(INFO) << "Processing committed_id from master: " << master_committed_id.ToString();
+      //LOG(INFO) << "Processing committed_id from master: " << master_committed_id.ToString();
       Status s= db->CommitAppLog(master_committed_id);
       if(!s.ok()){
         return;
@@ -155,7 +155,6 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
     }
     // empty binlog treated as keepalive packet
     if (binlog_res.binlog().empty()) {
-      LOG(INFO) << "Received keepalive packet from master";
       continue;
     }
     
@@ -166,7 +165,6 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
     if (received_binlog.size() >= sizeof(BATCH_MAGIC) &&
         *reinterpret_cast<const uint32_t*>(received_binlog.data()) == BATCH_MAGIC) {
       // This is a batched binlog
-      LOG(INFO) << "Received batched binlog from master, size: " << received_binlog.size();
       const char* ptr = received_binlog.data() + sizeof(BATCH_MAGIC);
       const char* end = received_binlog.data() + received_binlog.size();
       while (ptr < end) {
@@ -185,7 +183,7 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
         individual_binlogs.emplace_back(ptr, item_len);
         ptr += item_len;
       }
-      LOG(INFO) << "Received " << individual_binlogs.size() << " individual binlogs in batch for db " << db_name;
+      LOG(INFO) << "Received a batch of " << individual_binlogs.size() << " commands.";
     } else {
       // This is a single binlog
       LOG(INFO) << "Received single binlog from master, size: " << received_binlog.size();
@@ -210,14 +208,11 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
       }
       processed_count++;
     }
-    LOG(INFO) << "Processed " << processed_count << " binlog entries for db " << db_name;
   }
-  
-  LOG(INFO) << "Successfully processed " << processed_count << " binlog entries";
+  //LOG(INFO) << "Successfully processed " << processed_count << " binlog entries";
 
   if (only_keepalive) {
     ack_end = LogOffset();
-    LOG(INFO) << "Sending keepalive ACK to master";
   } else {
     LogOffset productor_status;
     // Reply Ack to master immediately
@@ -228,16 +223,13 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
     ack_end.l_offset.term = pb_end.l_offset.term;
     
     //Force flush to ensure data persistence
-    Status s = logger->Sync();
+    Status s = db->SyncBinlogAndWait();
     if (!s.ok()) {
       LOG(WARNING) << "Failed to sync binlog to disk: " << s.ToString();
       return;
     }
-    LOG(INFO) << "Synced binlog to disk, sending ACK to master from " 
-              << ack_start.ToString() << " to " << ack_end.ToString();
   }
 
-  LOG(INFO) << "Sending ACK for db " << db_name << " from " << ack_start.ToString() << " to " << ack_end.ToString();
   g_pika_rm->SendBinlogSyncAckRequest(db_name, ack_start, ack_end);
 }
 

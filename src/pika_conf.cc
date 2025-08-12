@@ -528,6 +528,10 @@ int PikaConf::Load() {
   if (binlog_file_size_ < 1024 || static_cast<int64_t>(binlog_file_size_) > (1024LL * 1024 * 1024)) {
     binlog_file_size_ = 100 * 1024 * 1024;  // 100M
   }
+  GetConfIntHuman("binlog-fsync-size", &binlog_fsync_size_);
+  if (binlog_fsync_size_ <= 0) {
+    binlog_fsync_size_ = 8 * 1024 * 1024;
+  }
   GetConfStr("pidfile", &pidfile_);
 
   // db sync
@@ -707,14 +711,29 @@ int PikaConf::Load() {
     rsync_timeout_ms_.store(tmp_rsync_timeout_ms);
   }
 
-  consensus_batch_size_ = 100;
-  consensus_timeout_ = 1000; // 1s
-
   GetConfInt("consensus-batch-size", &consensus_batch_size_);
-  GetConfInt("consensus-timeout", &consensus_timeout_);
-  return ret;
-}
+  if (consensus_batch_size_ <= 0) {
+    consensus_batch_size_ = 100;
+  }
+  if (consensus_batch_size_ > 100000) {
+    consensus_batch_size_ = 100000;
+  }
 
+  GetConfInt("consensus-timeout", &consensus_timeout_);
+  if (consensus_timeout_ <= 0) {
+    consensus_timeout_ = 1500;
+  }
+  if (consensus_timeout_ > 1000000) {
+    consensus_timeout_ = 1000000;
+  }
+  GetConfInt("replication-ack-timeout", &replication_ack_timeout_);
+  if (replication_ack_timeout_ <= 0) {
+    replication_ack_timeout_ = 5000;
+  }
+ 
+   return ret;
+ }
+ 
 void PikaConf::TryPushDiffCommands(const std::string& command, const std::string& value) {
   if (!CheckConfExist(command)) {
     diff_commands_[command] = value;
@@ -775,6 +794,7 @@ int PikaConf::ConfigRewrite() {
   SetConfStr("run-id", run_id_);
   SetConfStr("replication-id", replication_id_);
   SetConfInt("max-cache-statistic-keys", max_cache_statistic_keys_);
+  SetConfInt("binlog-fsync-size", binlog_fsync_size_);
   SetConfInt("small-compaction-threshold", small_compaction_threshold_);
   SetConfInt("small-compaction-duration-threshold", small_compaction_duration_threshold_);
   SetConfInt("max-client-response-size", static_cast<int32_t>(max_client_response_size_));
@@ -795,6 +815,9 @@ int PikaConf::ConfigRewrite() {
   SetConfInt("replication-num", replication_num_.load());
   SetConfStr("slow-cmd-list", pstd::Set2String(slow_cmd_set_, ','));
   SetConfInt("max-conn-rbuf-size", max_conn_rbuf_size_.load());
+  SetConfInt("consensus-batch-size", consensus_batch_size_);
+  SetConfInt("consensus-timeout", consensus_timeout_);
+  SetConfInt("replication-ack-timeout", replication_ack_timeout_);
   // options for storage engine
   SetConfInt("max-cache-files", max_cache_files_);
   SetConfInt("max-background-compactions", max_background_compactions_);
@@ -917,7 +940,3 @@ std::vector<rocksdb::CompressionType> PikaConf::compression_per_level() {
   }
   return types;
 }
-
-int PikaConf::consensus_batch_size() const { return consensus_batch_size_; }
-
-int PikaConf::consensus_timeout() const { return consensus_timeout_; }

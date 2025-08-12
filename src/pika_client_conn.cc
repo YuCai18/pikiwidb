@@ -19,6 +19,7 @@
 #include "net/src/dispatch_thread.h"
 #include "net/src/worker_thread.h"
 #include "src/pstd/include/scope_record_lock.h"
+#include <future>
 
 #include "rocksdb/perf_context.h"
 #include "rocksdb/iostats_context.h"
@@ -357,14 +358,63 @@ void PikaClientConn::DoBackgroundTask(void* arg) {
 }
 
 void PikaClientConn::BatchExecRedisCmd(const std::vector<net::RedisCmdArgsType>& argvs, bool cache_miss_in_rtc) {
-  resp_num.store(static_cast<int32_t>(argvs.size()));
-  for (const auto& argv : argvs) {
-    std::shared_ptr<std::string> resp_ptr = std::make_shared<std::string>();
-    resp_array.push_back(resp_ptr);
-    ExecRedisCmd(argv, resp_ptr, cache_miss_in_rtc);
+  if (argvs.empty()) {
+    return;
   }
-  time_stat_->process_done_ts_ = pstd::NowMicros();
-  TryWriteResp();
+  if (argvs.size() > 1) {
+    auto task = std::make_shared<ParallelTask>();
+    task->total_tasks = argvs.size();
+    task->resps.resize(argvs.size());
+
+    for (size_t i = 0; i < argvs.size(); ++i) {
+      task->resps[i] = std::make_shared<std::string>();
+      std::promise<void> promise;
+      task->futures.push_back(promise.get_future());
+      
+      g_pika_server->ScheduleClientPool(&PikaClientConn::ParallelExecRedisCmd, new std::tuple(shared_from_this(), argvs[i], task, i, std::move(promise), cache_miss_in_rtc), false, false);
+    }
+
+    for (auto& f : task->futures) {
+      f.get();
+    }
+
+    for (const auto& resp : task->resps) {
+      WriteResp(*resp);
+    }
+    if (write_completed_cb_) {
+      write_completed_cb_();
+      write_completed_cb_ = nullptr;
+    }
+    NotifyEpoll(true);
+  } else {
+    resp_num.store(static_cast<int32_t>(argvs.size()));
+    for (const auto& argv : argvs) {
+      std::shared_ptr<std::string> resp_ptr = std::make_shared<std::string>();
+      resp_array.push_back(resp_ptr);
+      ExecRedisCmd(argv, resp_ptr, cache_miss_in_rtc);
+    }
+    time_stat_->process_done_ts_ = pstd::NowMicros();
+    TryWriteResp();
+  }
+}
+
+void PikaClientConn::ParallelExecRedisCmd(void* arg) {
+    auto* task_args = static_cast<std::tuple<std::shared_ptr<PikaClientConn>, net::RedisCmdArgsType, std::shared_ptr<ParallelTask>, size_t, std::promise<void>, bool>*>(arg);
+    auto [conn, argv, task, index, promise, cache_miss_in_rtc] = std::move(*task_args);
+    delete task_args;
+
+    std::string opt = argv[0];
+    pstd::StringToLower(opt);
+    if (opt == kClusterPrefix) {
+        if (argv.size() >= 2) {
+            opt += argv[1];
+            pstd::StringToLower(opt);
+        }
+    }
+
+    std::shared_ptr<Cmd> cmd_ptr = conn->DoCmd(argv, opt, task->resps[index], cache_miss_in_rtc);
+    *(task->resps[index]) = std::move(cmd_ptr->res().message());
+    promise.set_value();
 }
 
 bool PikaClientConn::ReadCmdInCache(const net::RedisCmdArgsType& argv, const std::string& opt) {

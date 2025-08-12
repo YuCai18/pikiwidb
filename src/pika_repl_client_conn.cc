@@ -14,6 +14,13 @@
 #include "pstd/include/pstd_string.h"
 #include "pika_inner_message.pb.h"
 
+#include <vector>
+#include <memory>
+#include <arpa/inet.h>
+#include "net/include/net_conn.h"
+#include "net/include/net_thread.h"
+#include "net/include/pb_conn.h"
+
 using pstd::Status;
 
 extern PikaServer* g_pika_server;

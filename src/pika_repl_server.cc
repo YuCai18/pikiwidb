@@ -11,6 +11,7 @@
 #include "include/pika_conf.h"
 #include "include/pika_rm.h"
 #include "include/pika_server.h"
+#include "pstd/include/pstd_string.h"
 
 using pstd::Status;
 
@@ -89,51 +90,80 @@ void PikaReplServer::BuildBinlogOffset(const LogOffset& offset, InnerMessage::Bi
   boffset->set_index(offset.l_offset.index);
 }
 
-void PikaReplServer::BuildBinlogSyncResp(const std::vector<WriteTask>& tasks, InnerMessage::InnerResponse* response) {
-  //LOG(INFO) << "BuildBinlogSyncResp with " << tasks.size() << " tasks";
-  response->set_code(InnerMessage::kOk);
+// void PikaReplServer::BuildBinlogSyncResp(const std::vector<WriteTask>& tasks, InnerMessage::InnerResponse* response) {
+//   //LOG(INFO) << "BuildBinlogSyncResp with " << tasks.size() << " tasks";
+//   response->set_code(InnerMessage::kOk);
+//   response->set_type(InnerMessage::Type::kBinlogSync);
+//   // Unpack the batch package and serialize it item by item
+//   for (const auto& task : tasks) {
+//     const std::string& binlog = task.binlog_chip_.binlog_;
+//     // if (binlog.size() >= 8 && *reinterpret_cast<const uint32_t*>(binlog.data()) == htonl(PIKA_BATCH_MAGIC)) {
+//     //   // This is a batch
+//     //   size_t offset = sizeof(uint32_t);
+//     //   while (offset < binlog.size()) {
+//     //     uint32_t len = ntohl(*reinterpret_cast<const uint32_t*>(binlog.data() + offset));
+//     //     offset += sizeof(uint32_t);
+
+//     //     InnerMessage::InnerResponse::BinlogSync* binlog_sync = response->add_binlog_sync();
+//     //     binlog_sync->set_session_id(task.rm_node_.SessionId());
+//     //     InnerMessage::Slot* db = binlog_sync->mutable_slot();
+//     //     db->set_db_name(task.rm_node_.DBName());
+//     //     db->set_slot_id(0);
+
+//     //     // We use the offset of the last item in the batch for the whole batch
+//     //     InnerMessage::BinlogOffset* boffset = binlog_sync->mutable_binlog_offset();
+//     //     BuildBinlogOffset(task.binlog_chip_.offset_, boffset);
+//     //     if (g_pika_server->IsConsistency()) {
+//     //       InnerMessage::BinlogOffset* committed_id = binlog_sync->mutable_committed_id();
+//     //       BuildBinlogOffset(task.committed_id_, committed_id);
+//     //     }
+//     //     binlog_sync->set_binlog(binlog.data() + offset, len);
+//     //     offset += len;
+//     //   }
+//     // } else {
+//       // This is a single log
+//     InnerMessage::InnerResponse::BinlogSync* binlog_sync = response->add_binlog_sync();
+//     binlog_sync->set_session_id(task.rm_node_.SessionId());
+//     InnerMessage::Slot* db = binlog_sync->mutable_slot();
+//     db->set_db_name(task.rm_node_.DBName());
+//     db->set_slot_id(0);
+//     InnerMessage::BinlogOffset* boffset = binlog_sync->mutable_binlog_offset();
+//     BuildBinlogOffset(task.binlog_chip_.offset_, boffset);
+//     if (g_pika_server->IsConsistency()) {
+//       InnerMessage::BinlogOffset* committed_id = binlog_sync->mutable_committed_id();
+//       BuildBinlogOffset(task.committed_id_, committed_id);
+//     }
+//       binlog_sync->set_binlog(binlog);
+//     //}
+//   }
+// }
+
+void PikaReplServer::BuildBinlogSyncResp(const std::vector<WriteTask>& tasks, InnerMessage::InnerResponse* response){
+  if (tasks.empty()) {
+    return;
+  }
   response->set_type(InnerMessage::Type::kBinlogSync);
-  // Unpack the batch package and serialize it item by item
+  response->set_code(InnerMessage::kOk);
+
   for (const auto& task : tasks) {
-    const std::string& binlog = task.binlog_chip_.binlog_;
-    // if (binlog.size() >= 8 && *reinterpret_cast<const uint32_t*>(binlog.data()) == htonl(PIKA_BATCH_MAGIC)) {
-    //   // This is a batch
-    //   size_t offset = sizeof(uint32_t);
-    //   while (offset < binlog.size()) {
-    //     uint32_t len = ntohl(*reinterpret_cast<const uint32_t*>(binlog.data() + offset));
-    //     offset += sizeof(uint32_t);
-
-    //     InnerMessage::InnerResponse::BinlogSync* binlog_sync = response->add_binlog_sync();
-    //     binlog_sync->set_session_id(task.rm_node_.SessionId());
-    //     InnerMessage::Slot* db = binlog_sync->mutable_slot();
-    //     db->set_db_name(task.rm_node_.DBName());
-    //     db->set_slot_id(0);
-
-    //     // We use the offset of the last item in the batch for the whole batch
-    //     InnerMessage::BinlogOffset* boffset = binlog_sync->mutable_binlog_offset();
-    //     BuildBinlogOffset(task.binlog_chip_.offset_, boffset);
-    //     if (g_pika_server->IsConsistency()) {
-    //       InnerMessage::BinlogOffset* committed_id = binlog_sync->mutable_committed_id();
-    //       BuildBinlogOffset(task.committed_id_, committed_id);
-    //     }
-    //     binlog_sync->set_binlog(binlog.data() + offset, len);
-    //     offset += len;
-    //   }
-    // } else {
-      // This is a single log
     InnerMessage::InnerResponse::BinlogSync* binlog_sync = response->add_binlog_sync();
-    binlog_sync->set_session_id(task.rm_node_.SessionId());
+
+    const RmNode& node = task.rm_node_;
+    binlog_sync->set_session_id(node.SessionId());
+
     InnerMessage::Slot* db = binlog_sync->mutable_slot();
-    db->set_db_name(task.rm_node_.DBName());
+    db->set_db_name(node.DBName());
     db->set_slot_id(0);
+
     InnerMessage::BinlogOffset* boffset = binlog_sync->mutable_binlog_offset();
     BuildBinlogOffset(task.binlog_chip_.offset_, boffset);
+
     if (g_pika_server->IsConsistency()) {
       InnerMessage::BinlogOffset* committed_id = binlog_sync->mutable_committed_id();
       BuildBinlogOffset(task.committed_id_, committed_id);
     }
-      binlog_sync->set_binlog(binlog);
-    //}
+
+    binlog_sync->set_binlog(task.binlog_chip_.binlog_);
   }
 }
 

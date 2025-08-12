@@ -8,6 +8,7 @@
 #include "include/pika_define.h"
 #include "include/pika_rm.h"
 #include "include/pika_server.h"
+#include "include/pika_conf.h"
 
 extern PikaServer* g_pika_server;
 extern std::unique_ptr<PikaReplicaManager> g_pika_rm;
@@ -34,17 +35,23 @@ void* PikaAuxiliaryThread::ThreadMain() {
 
     g_pika_server->CheckLeaderProtectedMode();
 
-    // TODO(whoiami) timeout
-    s = g_pika_server->TriggerSendBinlogSync();
-    if (!s.ok()) {
-      LOG(WARNING) << s.ToString();
-    }
-    // send to peer
+    // send to peer first if there are queued packets
     int res = g_pika_server->SendToPeer();
     if (res == 0) {
-      // sleep 100 ms
+      // idle: wait for a short period (consensus-timeout) or notification
       std::unique_lock lock(mu_);
-      cv_.wait_for(lock, 100ms);
+      auto to = std::chrono::milliseconds(g_pika_conf->consensus_timeout());
+      if (to.count() <= 0) {
+        to = 10ms;
+      }
+      cv_.wait_for(lock, to);
+      // after wait, trigger replication send once (size/timeout gating will decide to send or not)
+      s = g_pika_server->TriggerSendBinlogSync();
+      if (!s.ok()) {
+        LOG(WARNING) << s.ToString();
+      }
+      // consume what may have been produced by trigger
+      g_pika_server->SendToPeer();
     } else {
       // LOG_EVERY_N(INFO, 1000) << "Consume binlog number " << res;
     }

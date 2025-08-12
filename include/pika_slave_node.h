@@ -78,6 +78,12 @@ class SlaveNode : public RmNode {
   pstd::Status Update(const LogOffset& start, const LogOffset& end, LogOffset* updated_offset);
 
   pstd::Mutex slave_mu;
+
+  // For replication batch
+  std::vector<WriteTask> task_buffer_;
+  uint64_t buffer_start_time_us_ = 0;
+  uint64_t ack_timeout_start_time_us_ = 0;
+  uint64_t pending_since_us_ = 0;
 };
 
 #endif  // PIKA_SLAVE_NODE_H

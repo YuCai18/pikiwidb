@@ -13,6 +13,7 @@
 #include "include/pika_slave_node.h"
 #include "include/pika_stable_log.h"
 #include "pstd/include/env.h"
+#include <future>
 
 class Context : public pstd::noncopyable {
  public:
@@ -129,7 +130,7 @@ class Log {
 
   Log();
   int Size();
-  void AppendLog(const LogItem& item);
+  pstd::Status AppendLog(const std::shared_ptr<StableLog>& stable_log, const std::shared_ptr<Cmd>& cmd_ptr);
   LogOffset LastOffset();
   LogOffset FirstOffset();
   LogItem At(int index);
@@ -154,6 +155,7 @@ class ConsensusCoordinator {
   // invoked by dbsync process
   pstd::Status Reset(const LogOffset& offset);
 
+  pstd::Status SyncAndWait();
   pstd::Status ProposeLog(const std::shared_ptr<Cmd>& cmd_ptr);
   pstd::Status UpdateSlave(const std::string& ip, int port, const LogOffset& start, const LogOffset& end);
   pstd::Status AddSlaveNode(const std::string& ip, int port, int session_id);
@@ -249,10 +251,10 @@ class ConsensusCoordinator {
  public:
   void InitContext() { context_->Init(); }
   bool checkFinished(const LogOffset& offset);
-  pstd::Status AppendEntries(const std::shared_ptr<Cmd>& cmd_ptr, LogOffset& cur_logoffset);
+  pstd::Status AppendEntries(const std::shared_ptr<Cmd>& cmd_ptr);
   void SetConsistency(bool is_consistency);
   bool GetISConsistency();
-  pstd::Status SendBinlog(std::shared_ptr<SlaveNode> slave_ptr, std::string db_name);
+  pstd::Status SendBinlog(const std::shared_ptr<SlaveNode>& slave_ptr, const std::string& db_name);
   pstd::Status Truncate(const LogOffset& offset);
   pstd::Status AppendSlaveEntries(const std::shared_ptr<Cmd>& cmd_ptr, const BinlogItem& attribute);
   pstd::Status CommitAppLog(const LogOffset& master_committed_id);
@@ -282,9 +284,19 @@ class ConsensusCoordinator {
   pstd::CondVar* GetCommittedIdCv() { return &committed_id_cv_; }
 
  private:
-  pstd::Status PersistAppendBinlog(const std::shared_ptr<Cmd>& cmd_ptr, LogOffset& cur_offset);
+  void SyncBinlogLoop();
+  pstd::Status PersistAppendBinlog(const std::shared_ptr<Cmd>& cmd_ptr);
 
  private:
+  // For async sync
+  pstd::Mutex sync_mu_;
+  pstd::CondVar sync_cv_;
+  std::atomic<bool> needs_sync_ = false;
+  std::atomic<bool> thread_stop_ = false;
+  std::thread sync_thread_;
+  pstd::Mutex promises_mu_;
+  std::vector<std::promise<pstd::Status>> sync_promises_;
+
   std::shared_mutex is_consistency_rwlock_;
   bool is_consistency_ = false;
   std::shared_mutex committed_id_rwlock_;
@@ -294,6 +306,7 @@ class ConsensusCoordinator {
   std::shared_mutex prepared_id__rwlock_;
   LogOffset prepared_id_ = LogOffset();
   std::shared_ptr<Log> logs_;
+  int binlog_fsync_counter_ = 0;
 };
 
 #endif  // INCLUDE_PIKA_CONSENSUS_H_

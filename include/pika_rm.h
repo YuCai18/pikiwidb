@@ -30,6 +30,7 @@
 #define kSendKeepAliveTimeout (2 * 1000000)
 #define kRecvKeepAliveTimeout (20 * 1000000)
 
+std::string CreateBatchFromTasks(const std::vector<WriteTask>& tasks);
 
 class SyncDB {
  public:
@@ -83,11 +84,11 @@ class SyncMasterDB : public SyncDB {
     return coordinator_.StableLogger()->Logger();
   }
 
+  std::shared_ptr<SlaveNode> GetSlaveNode(const std::string& ip, int port);
  private:
   // invoker need to hold slave_mu_
   pstd::Status ReadBinlogFileToWq(const std::shared_ptr<SlaveNode>& slave_ptr);
 
-  std::shared_ptr<SlaveNode> GetSlaveNode(const std::string& ip, int port);
   std::unordered_map<std::string, std::shared_ptr<SlaveNode>> GetAllSlaveNodes();
 
   pstd::Mutex session_mu_;
@@ -112,8 +113,7 @@ class SyncMasterDB : public SyncDB {
   pstd::Status UpdateCommittedID();
   pstd::Status CommitAppLog(const LogOffset& master_committed_id);
   pstd::Status Truncate(const LogOffset& offset);
-
-
+  pstd::Status SyncBinlogAndWait();
 };
 
 class SyncSlaveDB : public SyncDB {
@@ -245,8 +245,15 @@ class PikaReplicaManager {
 
   pstd::Mutex write_queue_mu_;
 
+  // db_name -> a queue of write task
+  using DBWriteTaskQueue = std::map<std::string, std::queue<WriteTask>>;
+  // ip:port -> a map of DBWriteTaskQueue
+  using SlaveWriteTaskQueue = std::map<std::string, DBWriteTaskQueue>;
+
   // every host owns a queue, the key is "ip + port"
-  std::unordered_map<std::string, std::unordered_map<std::string, std::queue<std::pair<WriteTask, uint64_t>>>> write_queues_;
+  SlaveWriteTaskQueue write_queues_;
+
+  // client for replica
   std::unique_ptr<PikaReplClient> pika_repl_client_;
   std::unique_ptr<PikaReplServer> pika_repl_server_;
 };

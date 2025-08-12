@@ -21,7 +21,6 @@ class PikaReplServerConn : public net::PbConn {
   PikaReplServerConn(int fd, const std::string& ip_port, net::Thread* thread, void* worker_specific_data,
                      net::NetMultiplexer* mpx);
   ~PikaReplServerConn() override;
-
   static void HandleMetaSyncRequest(void* arg);
   static void HandleTrySyncRequest(void* arg);
 
