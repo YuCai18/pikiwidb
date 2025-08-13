@@ -256,6 +256,18 @@ class PikaReplicaManager {
   // client for replica
   std::unique_ptr<PikaReplClient> pika_repl_client_;
   std::unique_ptr<PikaReplServer> pika_repl_server_;
+
+  // one-shot switch to force immediate send on next SendBinlog
+  std::atomic<bool> immediate_send_once_{false};
+ 
+  // consumer thread for write queue
+  std::thread bg_thread_;
+  pstd::CondVar bg_cv_;
+  std::atomic<bool> bg_thread_should_stop_{false};
+
+  std::shared_mutex is_consistency_rwlock_;
+  bool is_consistency_ = false;
+  std::shared_mutex committed_id_rwlock_;
 };
 
 #endif  //  PIKA_RM_H

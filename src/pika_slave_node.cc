@@ -30,8 +30,13 @@ bool SyncWindow::Update(const SyncWinItem& start_item, const SyncWinItem& end_it
       break;
     }
   }
-  if (start_pos == win_.size() || end_pos == win_.size()) {
-    LOG(WARNING) << "Ack offset Start: " << start_item.ToString() << "End: " << end_item.ToString()
+  // If start_item is not found, treat it as the beginning of the window
+  if (start_pos == win_.size()) {
+    start_pos = 0;
+  }
+  // end_item must be found to proceed
+  if (end_pos == win_.size()) {
+    LOG(WARNING) << "Ack offset End: " << end_item.ToString()
                  << " not found in binlog controller window." << std::endl
                  << "window status " << std::endl
                  << ToStringStatus();

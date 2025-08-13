@@ -532,6 +532,7 @@ Status SyncMasterDB::AppendCandidateBinlog(const std::string& ip, int port, cons
 }
 
 pstd::Status SyncMasterDB::SyncBinlogAndWait() {
+  g_pika_rm->WakeUpBinlogSync();
   return coordinator_.SyncAndWait();
 }
 
@@ -540,7 +541,6 @@ Status SyncMasterDB::ConsensusProposeLog(const std::shared_ptr<Cmd>& cmd_ptr) {
     if (!coordinator_.GetISConsistency()) {
         return coordinator_.ProposeLog(cmd_ptr);
     }
-    //LOG(INFO) << "Master DB (" << db_info_.db_name_ << ") ConsensusProposeLog";
 
     // Batch append without immediate waiting to allow high concurrency
     Status s = coordinator_.AppendEntries(cmd_ptr); // Append the log entry to the coordinator
@@ -557,42 +557,63 @@ Status SyncMasterDB::ConsensusProposeLog(const std::shared_ptr<Cmd>& cmd_ptr) {
     //     // TODO: 这里暂时注掉了sleep等待，50ms耗时过长，影响写入链路，后期需要改成条件变量唤醒方式
     //     //std::this_thread::sleep_for(std::chrono::milliseconds(50));
     // }
-    // Batch-wait policy: only wait once per consensus_timeout window or after enough appends
-    static thread_local uint64_t window_start_us = 0;
-    static thread_local int accepted_since_window = 0;
+    // Per-DB global batching window across threads
+    struct WindowState {
+      std::atomic<uint64_t> start_us{0};
+      std::atomic<int> accepted{0};
+    };
+    static std::unordered_map<std::string, WindowState> g_db_windows;
+    static pstd::Mutex g_db_windows_mu;
+
+    WindowState* ws = nullptr;
+    {
+      std::lock_guard<pstd::Mutex> lk(g_db_windows_mu);
+      ws = &g_db_windows[db_info_.db_name_];
+    }
+
     const uint64_t now_us = pstd::NowMicros();
     const uint64_t timeout_us = static_cast<uint64_t>(g_pika_conf->consensus_timeout()) * 1000ULL;
     const int min_batch_wait = std::max(50, g_pika_conf->consensus_batch_size());
 
-    if (window_start_us == 0) {
-      window_start_us = now_us;
-      accepted_since_window = 0;
+    uint64_t expected0 = 0;
+    if (ws->start_us.compare_exchange_strong(expected0, now_us)) {
+      ws->accepted.store(0, std::memory_order_relaxed);
     }
 
-    accepted_since_window++;
-    bool window_elapsed = (now_us - window_start_us) >= timeout_us;
-    bool enough_accumulated = accepted_since_window >= min_batch_wait;
+    ws->accepted.fetch_add(1, std::memory_order_relaxed);
+    uint64_t leader_election_token = ws->start_us.load(std::memory_order_relaxed);
+    bool window_elapsed = (now_us - leader_election_token) >= timeout_us;
+    bool enough_accumulated = ws->accepted.load(std::memory_order_relaxed) >= min_batch_wait;
 
     if (!window_elapsed && !enough_accumulated) {
-      // do not wait this time; let caller return fast to accept more writes
       return Status::OK();
     }
-    // Wait for consensus to be achieved using condition variable (once per window or batch)
+
+    // Attempt to close the current window and become the leader for this batch
+    if (ws->start_us.compare_exchange_strong(leader_election_token, 0)) {
+      // Success, we are the leader. Reset count and trigger send.
+      ws->accepted.store(0, std::memory_order_relaxed);
+      coordinator_.TriggerImmediateSend();
+      g_pika_rm->WakeUpBinlogSync();
+    } else {
+      // Lost the election. Another thread will handle the batch.
+      // My command will be in the *next* batch. So, just return OK.
+      return Status::OK();
+    }
+
+    // Block once per window: wait until committed_id catches prepared_id (end of current window)
     pstd::Mutex* mu = coordinator_.GetCommittedIdMu();
     pstd::CondVar* cv = coordinator_.GetCommittedIdCv();
     std::unique_lock<pstd::Mutex> lock(*mu);
 
     auto timeout = std::chrono::seconds(10);
-    LogOffset offset = coordinator_.GetPreparedId();
-    while (offset > coordinator_.GetCommittedId()) {
-        if (cv->wait_for(lock, timeout) == std::cv_status::timeout) {
-            return Status::Timeout("No consistency achieved within 10 seconds");
-        }
+    LogOffset window_end = coordinator_.GetPreparedId();
+    while (window_end > coordinator_.GetCommittedId()) {
+      if (cv->wait_for(lock, timeout) == std::cv_status::timeout) {
+        return Status::Timeout("No consistency achieved within 10 seconds");
+      }
     }
 
-    // reset window
-    window_start_us = pstd::NowMicros();
-    accepted_since_window = 0;
     return Status::OK();
 }
 
@@ -745,6 +766,7 @@ PikaReplicaManager::PikaReplicaManager() {
   pika_repl_client_ = std::make_unique<PikaReplClient>(3000, 60);
   pika_repl_server_ = std::make_unique<PikaReplServer>(ips, port, 3000);
   InitDB();
+  bg_thread_should_stop_.store(false);
 }
 
 void PikaReplicaManager::Start() {
@@ -760,11 +782,27 @@ void PikaReplicaManager::Start() {
     LOG(FATAL) << "Start Repl Server Error: " << ret
                << (ret == net::kCreateThreadError ? ": create thread error " : ": other error");
   }
+
+  bg_thread_ = std::thread([this]() {
+    while (!bg_thread_should_stop_.load()) {
+      int consumed_count = ConsumeWriteQueue();
+      if (consumed_count == 0) {
+        std::unique_lock<pstd::Mutex> lock(write_queue_mu_);
+        bg_cv_.wait_for(lock, std::chrono::milliseconds(100),
+                        [this] { return bg_thread_should_stop_.load() || !write_queues_.empty(); });
+      }
+    }
+  });
 }
 
 void PikaReplicaManager::Stop() {
   pika_repl_client_->Stop();
   pika_repl_server_->Stop();
+  bg_thread_should_stop_.store(true);
+  bg_cv_.notify_one();
+  if (bg_thread_.joinable()) {
+    bg_thread_.join();
+  }
 }
 
 bool PikaReplicaManager::CheckMasterSyncFinished() {
@@ -800,6 +838,7 @@ void PikaReplicaManager::ProduceWriteQueue(const std::string& ip, int port, std:
   for (auto& task : tasks) {
     write_queues_[index][db_name].push(task);
   }
+  bg_cv_.notify_one();
 }
 
 int PikaReplicaManager::ConsumeWriteQueue() {

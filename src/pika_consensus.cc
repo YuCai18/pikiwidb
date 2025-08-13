@@ -390,7 +390,16 @@ Status ConsensusCoordinator::UpdateSlave(const std::string& ip, int port, const 
     }
     {
       std::lock_guard l(slave_ptr->slave_mu);
-      slave_ptr->acked_offset = end;
+      // Treat this ACK as confirming everything before and including end
+      LogOffset updated_offset;
+      // Use empty start to indicate from the beginning of the window
+      slave_ptr->sync_win.Update(SyncWinItem(LogOffset()), SyncWinItem(end), &updated_offset);
+      if (!(updated_offset == LogOffset())) {
+        slave_ptr->acked_offset = updated_offset;
+      } else {
+        // Fallback to end if window was empty or no progress detected
+        slave_ptr->acked_offset = end;
+      }
       sync_pros_.AddMatchIndex(ip, port, slave_ptr->acked_offset);
       // LOG(INFO) << "PacificA slave ip: " << ip << ", port :" << port << ",slave acked_offset "
       //           << slave_ptr->acked_offset.ToString();
@@ -835,19 +844,43 @@ bool ConsensusCoordinator::checkFinished(const LogOffset& offset) {
 void ConsensusCoordinator::SyncBinlogLoop() {
   while (!thread_stop_.load()) {
     std::unique_lock<pstd::Mutex> lock(sync_mu_);
-    // timed wait to allow coalescing multiple appends
-    auto coalesce = std::chrono::milliseconds(g_pika_conf->consensus_timeout());
-    sync_cv_.wait_for(lock, coalesce, [this] { return needs_sync_.load() || thread_stop_.load(); });
-
+    // Wait until there is at least one pending append
+    sync_cv_.wait(lock, [this] { return needs_sync_.load() || thread_stop_.load(); });
     if (thread_stop_.load()) {
       break;
     }
-    if (!needs_sync_.load()) {
-      continue;
-    }
+    // Coalesce multiple appends in the next timeout window
+    auto coalesce = std::chrono::milliseconds(g_pika_conf->consensus_timeout());
+    lock.unlock();
+    std::this_thread::sleep_for(coalesce);
+    lock.lock();
 
     needs_sync_.store(false);
     pstd::Status s = stable_logger_->Logger()->Sync();
+
+    // Record fsynced offset (not beyond prepared_id_)
+    {
+      std::shared_lock prep_lock(prepared_id__rwlock_);
+      std::lock_guard fs_lock(fsynced_id_rwlock_);
+      if (prepared_id_ > last_fsynced_id_) {
+        last_fsynced_id_ = prepared_id_;
+      }
+    }
+
+    // After fsync, try to advance committed_id up to min(desired, fsynced)
+    {
+      std::shared_lock fs_lock(fsynced_id_rwlock_);
+      std::lock_guard commit_lock(committed_id_rwlock_);
+      LogOffset target = desired_committed_id_;
+      if (target > last_fsynced_id_) {
+        target = last_fsynced_id_;
+      }
+      if (target > committed_id_) {
+        committed_id_ = target;
+        context_->UpdateAppliedIndex(committed_id_);
+        committed_id_cv_.notify_all();
+      }
+    }
 
     std::lock_guard<pstd::Mutex> guard(promises_mu_);
     for (auto& p : sync_promises_) {
@@ -920,7 +953,9 @@ Status ConsensusCoordinator::AppendSlaveEntries(const std::shared_ptr<Cmd>& cmd_
                  << " cur last index " << last_index.l_offset.index;
     return Status::OK();
   }
+  auto start_us = pstd::NowMicros();
   Status s = PersistAppendBinlog(cmd_ptr);
+  auto end_us = pstd::NowMicros();
   if (!s.ok()) {
     return s;
   }
@@ -961,7 +996,7 @@ Status ConsensusCoordinator::UpdateCommittedID() {
   LogOffset slave_prepared_id = LogOffset();
 
   for (const auto& slave : slaves) {
-    if (slave.second->slave_state == kSlaveBinlogSync) {
+    if (slave.second->slave_state == kSlaveBinlogSync || slave.second->slave_state == SlaveState::KCandidate) {
       if (slave_prepared_id == LogOffset()) {
         slave_prepared_id = slave.second->acked_offset;
       } else if (slave.second->acked_offset < slave_prepared_id) {
@@ -1029,8 +1064,9 @@ pstd::Status ConsensusCoordinator::SendBinlog(const std::shared_ptr<SlaveNode>& 
     return Status::OK();
   }
 
+  // Gate: allow only one in-flight batch until ACK clears the sync window
   int batch_size = g_pika_conf->consensus_batch_size();
-  for (int i = start_index; i < logs_->Size() && tasks.size() < batch_size; ++i) {
+  for (int i = start_index; i < logs_->Size() && static_cast<int>(tasks.size()) < batch_size; ++i) {
     const auto& item = logs_->At(i);
     tasks.emplace_back(RmNode(slave_ptr->Ip(), slave_ptr->Port(), db_name, slave_ptr->SessionId()),
                        BinlogChip(item.offset, item.binlog_), item.offset, committed_index);
@@ -1045,13 +1081,21 @@ pstd::Status ConsensusCoordinator::SendBinlog(const std::shared_ptr<SlaveNode>& 
   // decide if we should send now based on size or timeout window
   bool size_triggered = (static_cast<int>(tasks.size()) >= batch_size);
   bool timeout_triggered = false;
-  if (slave_ptr->pending_since_us_ == 0 && !size_triggered) {
+
+  // one-shot immediate send to close current window
+  bool force_now = immediate_send_once_.exchange(false);
+
+  if (slave_ptr->pending_since_us_ == 0 && !size_triggered && !force_now) {
     // start pending window and wait for more logs or timeout
     slave_ptr->pending_since_us_ = now;
     return Status::OK();
   }
-  if (slave_ptr->pending_since_us_ > 0) {
-    timeout_triggered = (now - slave_ptr->pending_since_us_) >= (static_cast<uint64_t>(g_pika_conf->consensus_timeout()) * 1000ULL);
+  if (!size_triggered) {
+    if (force_now) {
+      timeout_triggered = true;
+    } else if (slave_ptr->pending_since_us_ > 0) {
+      timeout_triggered = (now - slave_ptr->pending_since_us_) >= (static_cast<uint64_t>(g_pika_conf->consensus_timeout()) * 1000ULL);
+    }
   }
   if (!size_triggered && !timeout_triggered) {
     return Status::OK();
@@ -1068,14 +1112,21 @@ pstd::Status ConsensusCoordinator::SendBinlog(const std::shared_ptr<SlaveNode>& 
   std::vector<WriteTask> final_tasks_to_send;
   final_tasks_to_send.push_back(batched_task);
   g_pika_rm->ProduceWriteQueue(slave_ptr->Ip(), slave_ptr->Port(), db_name, final_tasks_to_send);
+  // Immediately consume the write queue to send over network
+  // g_pika_rm->ConsumeWriteQueue();
 
   // Update slave node's state
   slave_ptr->sent_offset = last_task.binlog_chip_.offset_;
+  // Track every log item so ACK can consume the window in order
   for (const auto& task : tasks) {
-    slave_ptr->sync_win.Push(SyncWinItem(task.binlog_chip_.offset_));
+    slave_ptr->sync_win.Push(SyncWinItem(task.binlog_chip_.offset_, task.binlog_chip_.binlog_.size()));
   }
   // reset pending timer after sending
   slave_ptr->pending_since_us_ = 0;
+  // start ACK timeout tracking for this in-flight batch
+  if (slave_ptr->ack_timeout_start_time_us_ == 0) {
+    slave_ptr->ack_timeout_start_time_us_ = now;
+  }
 
   // trigger fsync coalesced with network send
   {

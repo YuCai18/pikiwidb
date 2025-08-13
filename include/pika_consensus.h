@@ -275,13 +275,36 @@ class ConsensusCoordinator {
     prepared_id_ = offset;
   }
   void SetCommittedId(const LogOffset& offset) {
+    // Record desired committed id (from quorum/ACK) first
+    LogOffset fsynced_snapshot;
+    {
+      std::shared_lock fs_lock(fsynced_id_rwlock_);
+      fsynced_snapshot = last_fsynced_id_;
+    }
+    // If desired commit goes beyond fsynced, proactively trigger fsync
+    if (offset > fsynced_snapshot) {
+      std::lock_guard<pstd::Mutex> lk(sync_mu_);
+      needs_sync_.store(true);
+      sync_cv_.notify_one();
+    }
     std::lock_guard l(committed_id_rwlock_);
-    committed_id_ = offset;
+    if (offset > desired_committed_id_) {
+      desired_committed_id_ = offset;
+    }
+    LogOffset target = desired_committed_id_;
+    if (target > fsynced_snapshot) {
+      target = fsynced_snapshot;
+    }
+    if (target > committed_id_) {
+      committed_id_ = target;
     context_->UpdateAppliedIndex(committed_id_);
     committed_id_cv_.notify_all();
+    }
   }
   pstd::Mutex* GetCommittedIdMu() { return &committed_id_mu_; }
   pstd::CondVar* GetCommittedIdCv() { return &committed_id_cv_; }
+  // force next SendBinlog call to send immediately, bypassing coalesce wait
+  void TriggerImmediateSend() { immediate_send_once_.store(true); }
 
  private:
   void SyncBinlogLoop();
@@ -296,6 +319,8 @@ class ConsensusCoordinator {
   std::thread sync_thread_;
   pstd::Mutex promises_mu_;
   std::vector<std::promise<pstd::Status>> sync_promises_;
+  // one-shot switch to force immediate send on next SendBinlog
+  std::atomic<bool> immediate_send_once_{false};
 
   std::shared_mutex is_consistency_rwlock_;
   bool is_consistency_ = false;
@@ -303,10 +328,14 @@ class ConsensusCoordinator {
   pstd::Mutex committed_id_mu_;
   pstd::CondVar committed_id_cv_;
   LogOffset committed_id_ = LogOffset();
+  LogOffset desired_committed_id_ = LogOffset();
   std::shared_mutex prepared_id__rwlock_;
   LogOffset prepared_id_ = LogOffset();
   std::shared_ptr<Log> logs_;
   int binlog_fsync_counter_ = 0;
+  // Track last fsynced offset to gate commit advancement
+  std::shared_mutex fsynced_id_rwlock_;
+  LogOffset last_fsynced_id_ = LogOffset();
 };
 
 #endif  // INCLUDE_PIKA_CONSENSUS_H_
