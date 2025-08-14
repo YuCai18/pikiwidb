@@ -541,12 +541,7 @@ Status SyncMasterDB::ConsensusProposeLog(const std::shared_ptr<Cmd>& cmd_ptr) {
     if (!coordinator_.GetISConsistency()) {
         return coordinator_.ProposeLog(cmd_ptr);
     }
-
-    // Batch append without immediate waiting to allow high concurrency
-    Status s = coordinator_.AppendEntries(cmd_ptr); // Append the log entry to the coordinator
-    if (!s.ok()) {
-        return s;
-    }
+    
 
     // Wait for consensus to be achieved within 10 seconds
     // while (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() < 10) {
@@ -559,6 +554,7 @@ Status SyncMasterDB::ConsensusProposeLog(const std::shared_ptr<Cmd>& cmd_ptr) {
     // }
     // Per-DB global batching window across threads
     struct WindowState {
+      pstd::Mutex mu;
       std::atomic<uint64_t> start_us{0};
       std::atomic<int> accepted{0};
     };
@@ -570,7 +566,20 @@ Status SyncMasterDB::ConsensusProposeLog(const std::shared_ptr<Cmd>& cmd_ptr) {
       std::lock_guard<pstd::Mutex> lk(g_db_windows_mu);
       ws = &g_db_windows[db_info_.db_name_];
     }
-
+    // Batch append without immediate waiting to allow high concurrency
+    // Status s = coordinator_.AppendEntries(cmd_ptr); // Append the log entry to the coordinator
+    // if (!s.ok()) {
+    //     return s;
+    // }
+    LogOffset my_offset;
+    {
+      std::lock_guard<pstd::Mutex> lk(ws->mu);
+      Status s = coordinator_.AppendEntries(cmd_ptr);
+      if (!s.ok()) {
+        return s;
+      }
+      my_offset = coordinator_.GetPreparedId();
+    }
     const uint64_t now_us = pstd::NowMicros();
     const uint64_t timeout_us = static_cast<uint64_t>(g_pika_conf->consensus_timeout()) * 1000ULL;
     const int min_batch_wait = std::max(50, g_pika_conf->consensus_batch_size());
@@ -585,20 +594,12 @@ Status SyncMasterDB::ConsensusProposeLog(const std::shared_ptr<Cmd>& cmd_ptr) {
     bool window_elapsed = (now_us - leader_election_token) >= timeout_us;
     bool enough_accumulated = ws->accepted.load(std::memory_order_relaxed) >= min_batch_wait;
 
-    if (!window_elapsed && !enough_accumulated) {
-      return Status::OK();
-    }
-
-    // Attempt to close the current window and become the leader for this batch
-    if (ws->start_us.compare_exchange_strong(leader_election_token, 0)) {
-      // Success, we are the leader. Reset count and trigger send.
-      ws->accepted.store(0, std::memory_order_relaxed);
-      coordinator_.TriggerImmediateSend();
-      g_pika_rm->WakeUpBinlogSync();
-    } else {
-      // Lost the election. Another thread will handle the batch.
-      // My command will be in the *next* batch. So, just return OK.
-      return Status::OK();
+    if (window_elapsed || enough_accumulated) {
+      if (ws->start_us.compare_exchange_strong(leader_election_token, 0)) {
+        ws->accepted.store(0, std::memory_order_relaxed);
+        coordinator_.TriggerImmediateSend();
+        g_pika_rm->WakeUpBinlogSync();
+      }
     }
 
     // Block once per window: wait until committed_id catches prepared_id (end of current window)
@@ -607,9 +608,12 @@ Status SyncMasterDB::ConsensusProposeLog(const std::shared_ptr<Cmd>& cmd_ptr) {
     std::unique_lock<pstd::Mutex> lock(*mu);
 
     auto timeout = std::chrono::seconds(10);
-    LogOffset window_end = coordinator_.GetPreparedId();
-    while (window_end > coordinator_.GetCommittedId()) {
+    //LogOffset window_end = coordinator_.GetPreparedId();
+    while (my_offset > coordinator_.GetCommittedId()) {
       if (cv->wait_for(lock, timeout) == std::cv_status::timeout) {
+        LOG(WARNING) << "Cmd wait for consensus timeout, db: " << db_info_.db_name_
+                     << " my_offset: " << my_offset.ToString()
+                     << " committed_id: " << coordinator_.GetCommittedId().ToString();
         return Status::Timeout("No consistency achieved within 10 seconds");
       }
     }
