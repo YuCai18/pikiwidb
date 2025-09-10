@@ -1,5 +1,8 @@
 #!/bin/bash
 
+sudo pkill -f "pika"
+sudo pkill redis-server
+redis-server --daemonize yes
 rm *.log
 rm -r ./db
 rm -r ./log
@@ -72,28 +75,19 @@ echo "等待第一轮写入完成..."
 wait $set1_pid $hset1_pid $lpush1_pid $sadd1_pid $zadd1_pid $xadd1_pid
 echo "✓ 第一轮写入操作全部完成"
 
-echo "开始第二轮写入..."
-./consistency_benchmark -mp 9221 -d 60 -r 60 -n 500000 -random-seed 54321 -log-file SET-54321.log SET __key__ __data__ & 
-set2_pid=$!
-./consistency_benchmark -mp 9221 -d 59 -r 59 -n 500000 -random-seed 54321 -log-file HSET-54321.log HSET __key__ __key__ __data__ & 
-hset2_pid=$!
-./consistency_benchmark -mp 9221 -d 58 -r 58 -n 500000 -random-seed 54321 -log-file LPUSH-54321.log LPUSH __key__ __key__ __key__ &
-lpush2_pid=$!
-./consistency_benchmark -mp 9221 -d 57 -r 57 -n 500000 -random-seed 54321 -log-file SADD-54321.log SADD __key__ __key__ __data__ &
-sadd2_pid=$!
-./consistency_benchmark -mp 9221 -d 56 -r 56 -n 500000 -random-seed 54321 -log-file ZADD-54321.log ZADD __key__ 10 __key__ 9 __key__ &
-zadd2_pid=$!
-./consistency_benchmark -mp 9221 -d 55 -r 55 -n 500000 -random-seed 54321 -log-file XADD-54321.log XADD __key__ 1 __key__ __data__ __key__ __data__ &
-xadd2_pid=$!
-
-echo "等待第二轮写入完成..."
-wait $set2_pid $hset2_pid $lpush2_pid $sadd2_pid $zadd2_pid $xadd2_pid
-echo "✓ 第二轮写入操作全部完成"
-
 echo "启动迁移工具..."
 # start migrateDB
 ./dbtest/migrateDB/pika -c ./dbtest/migrateDB/pika.conf &
+migrate_pika_pid=$!
+echo "迁移工具PID: $migrate_pika_pid"
 sleep 20
+
+# 检查迁移工具是否正常启动
+if ! kill -0 $migrate_pika_pid 2>/dev/null; then
+    echo "❌ 迁移工具启动失败"
+    exit 1
+fi
+echo "✓ 迁移工具启动成功"
 
 echo "设置binlog保留数量..."
 redis-cli -p 9221 -c config set expire-logs-nums 10000
