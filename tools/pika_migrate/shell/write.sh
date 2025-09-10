@@ -33,6 +33,12 @@ sed -i.bak  \
     -e 's|pidfile : ./pika.pid|pidfile : ./dbtest/sourceDB/pika.pid|'    \
     ./dbtest/sourceDB/pika.conf
 
+if grep -q "db-path : ./dbtest/sourceDB/db/" ./dbtest/sourceDB/pika.conf; then
+    echo "sourceDB sed修改成功"
+else
+    echo "sourceDB sed修改失败"
+fi
+
 sed -i.bak  \
     -e 's|thread-num : 1|thread-num : 8|'    \
     -e 's|thread-pool-size : 12|thread-pool-size : 64|'    \
@@ -52,7 +58,7 @@ sed -i.bak  \
     -e 's|thread-num : 1|thread-num : 8|'    \
     -e 's|thread-pool-size : 12|thread-pool-size : 64|'    \
     -e 's|write-buffer-size : 268435456|write-buffer-size : 256M|'    \
-    -e 's|port : 9221|port : 9251|'    \
+    -e 's|port : 9222|port : 9251|'    \
     -e 's|#daemonize : yes|domonize: yes|'    \
     -e 's|#rate-limiter-bandwidth : 1099511627776|rate-limiter-bandwidth : 1099511627776|'    \
     -e 's|max-background-jobs : 3|max-background-jobs : 12|'    \
