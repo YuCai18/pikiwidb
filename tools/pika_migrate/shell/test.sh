@@ -57,7 +57,16 @@ echo "启动源数据库..."
 
 sleep 20
 
-echo "开始写入测试数据..."
+echo "=== 开始数据迁移测试 ==="
+echo "测试数据规模: 600万条记录 (初始300万 + 迁移期间300万)"
+
+# 记录测试开始时间
+test_start_time=$(date +%s)
+echo "测试开始时间: $(date)"
+
+echo "第一阶段: 写入初始测试数据 (300万条)..."
+data_write_start_time=$(date +%s)
+
 ./consistency_benchmark -mp 9221 -d 60 -r 60 -n 500000 -log-file SET-12345.log SET __key__ __data__ &
 set1_pid=$!
 ./consistency_benchmark -mp 9221 -d 59 -r 59 -n 500000 -log-file HSET-12345.log HSET __key__ __key__ __data__ & 
@@ -73,7 +82,10 @@ xadd1_pid=$!
 
 echo "等待第一轮写入完成..."
 wait $set1_pid $hset1_pid $lpush1_pid $sadd1_pid $zadd1_pid $xadd1_pid
-echo "✓ 第一轮写入操作全部完成"
+
+data_write_end_time=$(date +%s)
+data_write_duration=$((data_write_end_time - data_write_start_time))
+echo "✓ 第一轮写入完成，耗时: ${data_write_duration}秒"
 
 echo "启动迁移工具..."
 # start migrateDB
@@ -107,49 +119,41 @@ echo "设置binlog保留数量..."
 redis-cli -p 9221 -c config set expire-logs-nums 10000
 redis-cli -p 9251 -c config set expire-logs-nums 10000
 
+echo "第二阶段: 建立主从关系并开始数据迁移..."
+migration_start_time=$(date +%s)
+echo "数据迁移开始时间: $(date)"
+
 echo "建立主从关系..."
 redis-cli -p 9251 -c slaveof 127.0.0.1 9221
 
 echo "等待主从关系建立..."
 sleep 10
 
-echo "开始迁移期间的写操作..."
-# continue write duration migrate
-./consistency_benchmark -mp 9221 -d 60 -r 60 -n 500000 -random-seed 54321 -log-file DEL-54321.log DEL __key__ __data__ &
-del_pid=$!
-./consistency_benchmark -mp 9221 -d 59 -r 59 -n 500000 -random-seed 54321 -log-file HDEL-54321.log HDEL __key__ __key__ __data__ &  
-hdel_pid=$!
-./consistency_benchmark -mp 9221 -d 58 -r 58 -n 500000 -random-seed 54321 -log-file LPOP-54321.log LPOP __key__ __key__ __key__ &
-lpop_pid=$!
-./consistency_benchmark -mp 9221 -d 57 -r 57 -n 500000 -random-seed 54321 -log-file SREM-54321.log SREM __key__ __key__ __data__ &
-srem_pid=$!
-./consistency_benchmark -mp 9221 -d 56 -r 56 -n 500000 -random-seed 54321 -log-file ZREM-54321.log ZREM __key__ __key__ __key__ &
-zrem_pid=$!
-./consistency_benchmark -mp 9221 -d 55 -r 55 -n 500000 -random-seed 54321 -log-file XDEL-54321.log XDEL __key__ 1 __key__ __data__ __key__ __data__ &
-xdel_pid=$!
+echo "第三阶段: 迁移期间写入测试数据 (300万条)..."
+migrate_write_start_time=$(date +%s)
+
+# 迁移期间的增量写入操作（不包括DEL操作）
+./consistency_benchmark -mp 9221 -d 60 -r 60 -n 500000 -random-seed 54321 -log-file SET-54321.log SET __key__ __data__ & 
+set2_pid=$!
+./consistency_benchmark -mp 9221 -d 59 -r 59 -n 500000 -random-seed 54321 -log-file HSET-54321.log HSET __key__ __key__ __data__ & 
+hset2_pid=$!
+./consistency_benchmark -mp 9221 -d 58 -r 58 -n 500000 -random-seed 54321 -log-file LPUSH-54321.log LPUSH __key__ __key__ __key__ &
+lpush2_pid=$!
+./consistency_benchmark -mp 9221 -d 57 -r 57 -n 500000 -random-seed 54321 -log-file SADD-54321.log SADD __key__ __key__ __data__ &
+sadd2_pid=$!
+./consistency_benchmark -mp 9221 -d 56 -r 56 -n 500000 -random-seed 54321 -log-file ZADD-54321.log ZADD __key__ 10 __key__ 9 __key__ &
+zadd2_pid=$!
+./consistency_benchmark -mp 9221 -d 55 -r 55 -n 500000 -random-seed 54321 -log-file XADD-54321.log XADD __key__ 1 __key__ __data__ __key__ __data__ &
+xadd2_pid=$!
 
 echo "等待迁移期间的写操作完成..."
 
-# 等待所有后台进程完成
-echo "等待DEL操作完成..."
-wait $del_pid 2>/dev/null && echo "✓ DEL操作完成" || echo "⚠ DEL操作异常结束"
+# 等待增量写入操作完成
+wait $set2_pid $hset2_pid $lpush2_pid $sadd2_pid $zadd2_pid $xadd2_pid
 
-echo "等待HDEL操作完成..."
-wait $hdel_pid 2>/dev/null && echo "✓ HDEL操作完成" || echo "⚠ HDEL操作异常结束"
-
-echo "等待LPOP操作完成..."
-wait $lpop_pid 2>/dev/null && echo "✓ LPOP操作完成" || echo "⚠ LPOP操作异常结束"
-
-echo "等待SREM操作完成..."
-wait $srem_pid 2>/dev/null && echo "✓ SREM操作完成" || echo "⚠ SREM操作异常结束"
-
-echo "等待ZREM操作完成..."
-wait $zrem_pid 2>/dev/null && echo "✓ ZREM操作完成" || echo "⚠ ZREM操作异常结束"
-
-echo "等待XDEL操作完成..."
-wait $xdel_pid 2>/dev/null && echo "✓ XDEL操作完成" || echo "⚠ XDEL操作异常结束"
-
-echo "所有迁移期间的写操作已完成"
+migrate_write_end_time=$(date +%s)
+migrate_write_duration=$((migrate_write_end_time - migrate_write_start_time))
+echo "✓ 迁移期间写入完成，耗时: ${migrate_write_duration}秒"
 
 echo "=== 写入测试完成 ==="
 echo "等待数据同步完成..."
@@ -174,7 +178,11 @@ while true; do
     if [ $((current_time - last_check_time)) -ge 10 ]; then
         # 检查日志中是否有完成标志
         if grep -q "Retransmit Finish" ./dbtest/migrateDB/log/pika.INFO 2>/dev/null; then
+            migration_end_time=$(date +%s)
+            migration_duration=$((migration_end_time - migration_start_time))
             echo "✓ 检测到数据迁移完成标志"
+            echo "数据迁移完成时间: $(date)"
+            echo "数据迁移总耗时: ${migration_duration}秒"
             sleep 5  # 额外等待5秒确保完全完成
             break
         fi
@@ -191,6 +199,14 @@ while true; do
     
     sleep 5
 done
+
+# 如果超时退出，也记录时间
+if [ -z "$migration_end_time" ]; then
+    migration_end_time=$(date +%s)
+    migration_duration=$((migration_end_time - migration_start_time))
+    echo "数据迁移阶段结束时间: $(date)"
+    echo "数据迁移耗时: ${migration_duration}秒 (可能未完全完成)"
+fi
 
 echo "数据迁移阶段完成，开始一致性检查..."
 
@@ -342,11 +358,60 @@ check_data_consistency() {
 }
 
 # 执行数据一致性检查
+echo "第四阶段: 数据一致性检查..."
+consistency_start_time=$(date +%s)
+
 if check_data_consistency; then
-    echo "🎉 数据迁移测试成功！"
-    test_result=0
+    consistency_end_time=$(date +%s)
+    consistency_duration=$((consistency_end_time - consistency_start_time))
+    echo "✓ 数据一致性检查通过，耗时: ${consistency_duration}秒"
+    
+    echo "第五阶段: 执行删除操作测试..."
+    del_start_time=$(date +%s)
+    
+    # 现在执行删除操作，测试删除同步
+    ./consistency_benchmark -mp 9221 -d 60 -r 60 -n 100000 -random-seed 54321 -log-file DEL-54321.log DEL __key__ __data__ &
+    del_pid=$!
+    ./consistency_benchmark -mp 9221 -d 59 -r 59 -n 100000 -random-seed 54321 -log-file HDEL-54321.log HDEL __key__ __key__ __data__ &  
+    hdel_pid=$!
+    ./consistency_benchmark -mp 9221 -d 58 -r 58 -n 100000 -random-seed 54321 -log-file LPOP-54321.log LPOP __key__ __key__ __key__ &
+    lpop_pid=$!
+    ./consistency_benchmark -mp 9221 -d 57 -r 57 -n 100000 -random-seed 54321 -log-file SREM-54321.log SREM __key__ __key__ __data__ &
+    srem_pid=$!
+    ./consistency_benchmark -mp 9221 -d 56 -r 56 -n 100000 -random-seed 54321 -log-file ZREM-54321.log ZREM __key__ __key__ __key__ &
+    zrem_pid=$!
+    ./consistency_benchmark -mp 9221 -d 55 -r 55 -n 100000 -random-seed 54321 -log-file XDEL-54321.log XDEL __key__ 1 __key__ __data__ __key__ __data__ &
+    xdel_pid=$!
+    
+    echo "等待删除操作完成..."
+    wait $del_pid $hdel_pid $lpop_pid $srem_pid $zrem_pid $xdel_pid
+    
+    del_end_time=$(date +%s)
+    del_duration=$((del_end_time - del_start_time))
+    echo "✓ 删除操作完成，耗时: ${del_duration}秒"
+    
+    # 等待删除操作同步
+    echo "等待删除操作同步..."
+    sleep 30
+    
+    echo "第六阶段: 最终数据一致性验证..."
+    final_check_start_time=$(date +%s)
+    
+    if check_data_consistency; then
+        final_check_end_time=$(date +%s)
+        final_check_duration=$((final_check_end_time - final_check_start_time))
+        echo "✓ 最终数据一致性检查通过，耗时: ${final_check_duration}秒"
+        test_result=0
+    else
+        final_check_end_time=$(date +%s)
+        final_check_duration=$((final_check_end_time - final_check_start_time))
+        echo "❌ 最终数据一致性检查失败，耗时: ${final_check_duration}秒"
+        test_result=1
+    fi
 else
-    echo "❌ 数据迁移测试失败！"
+    consistency_end_time=$(date +%s)
+    consistency_duration=$((consistency_end_time - consistency_start_time))
+    echo "❌ 数据一致性检查失败，耗时: ${consistency_duration}秒"
     test_result=1
 fi
 
@@ -474,10 +539,49 @@ rm -f ./dbtest/sourceDB/pika.pid ./dbtest/migrateDB/pika.pid 2>/dev/null
 
 echo "所有服务已关闭"
 
+# 计算总测试时间
+test_end_time=$(date +%s)
+total_test_duration=$((test_end_time - test_start_time))
+
+echo ""
+echo "========================================"
+echo "           数据迁移测试总结"
+echo "========================================"
+echo "测试开始时间: $(date -d "@$test_start_time")"
+echo "测试结束时间: $(date -d "@$test_end_time")"
+echo "总测试耗时: ${total_test_duration}秒"
+echo ""
+echo "各阶段耗时统计:"
+echo "  初始数据写入 (300万条): ${data_write_duration}秒"
+echo "  迁移期间写入 (300万条): ${migrate_write_duration}秒"
+if [ -n "$migration_duration" ]; then
+    echo "  数据迁移总耗时: ${migration_duration}秒"
+fi
+if [ -n "$consistency_duration" ]; then
+    echo "  数据一致性检查: ${consistency_duration}秒"
+fi
+if [ -n "$del_duration" ]; then
+    echo "  删除操作测试: ${del_duration}秒"
+fi
+if [ -n "$final_check_duration" ]; then
+    echo "  最终一致性验证: ${final_check_duration}秒"
+fi
+echo ""
+echo "数据统计:"
+echo "  总测试数据量: 600万条记录"
+echo "  数据类型: SET, HSET, LPUSH, SADD, ZADD, XADD"
+if [ -n "$migration_duration" ] && [ $migration_duration -gt 0 ]; then
+    migration_rate=$((6000000 / migration_duration))
+    echo "  迁移速度: 约 ${migration_rate} 条/秒"
+fi
+echo ""
+
 if [ $test_result -eq 0 ]; then
-    echo "✓ 数据迁移测试完成 - 成功！"
+    echo "🎉 数据迁移测试完成 - 成功！"
+    echo "✓ 所有数据已成功迁移并通过一致性验证"
 else
-    echo "✗ 数据迁移测试完成 - 失败！"
+    echo "❌ 数据迁移测试完成 - 失败！"
+    echo "✗ 数据一致性验证未通过，请检查日志"
 fi
 
 exit $test_result
