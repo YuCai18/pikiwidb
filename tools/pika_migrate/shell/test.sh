@@ -87,6 +87,11 @@ data_write_end_time=$(date +%s)
 data_write_duration=$((data_write_end_time - data_write_start_time))
 echo "✓ 第一轮写入完成，耗时: ${data_write_duration}秒"
 
+# 统计初始数据的磁盘占用
+initial_data_size=$(du -sh ./dbtest/sourceDB/db/ 2>/dev/null | cut -f1 || echo "0")
+initial_data_bytes=$(du -sb ./dbtest/sourceDB/db/ 2>/dev/null | cut -f1 || echo "0")
+echo "初始数据磁盘占用: ${initial_data_size}"
+
 echo "启动迁移工具..."
 # start migrateDB
 ./dbtest/migrateDB/pika -c ./dbtest/migrateDB/pika.conf &
@@ -155,6 +160,11 @@ migrate_write_end_time=$(date +%s)
 migrate_write_duration=$((migrate_write_end_time - migrate_write_start_time))
 echo "✓ 迁移期间写入完成，耗时: ${migrate_write_duration}秒"
 
+# 统计600万数据的总磁盘占用
+total_source_data_size=$(du -sh ./dbtest/sourceDB/db/ 2>/dev/null | cut -f1 || echo "0")
+total_source_data_bytes=$(du -sb ./dbtest/sourceDB/db/ 2>/dev/null | cut -f1 || echo "0")
+echo "源数据库总数据量(600万条): ${total_source_data_size}"
+
 echo "=== 写入测试完成 ==="
 echo "等待数据同步完成..."
 
@@ -183,6 +193,12 @@ while true; do
             echo "✓ 检测到数据迁移完成标志"
             echo "数据迁移完成时间: $(date)"
             echo "数据迁移总耗时: ${migration_duration}秒"
+            
+            # 统计迁移后的磁盘占用
+            migrated_data_size=$(du -sh ./dbtest/migrateDB/db/ 2>/dev/null | cut -f1 || echo "0")
+            migrated_data_bytes=$(du -sb ./dbtest/migrateDB/db/ 2>/dev/null | cut -f1 || echo "0")
+            echo "迁移后数据量: ${migrated_data_size}"
+            
             sleep 5  # 额外等待5秒确保完全完成
             break
         fi
@@ -200,12 +216,17 @@ while true; do
     sleep 5
 done
 
-# 如果超时退出，也记录时间
+# 如果超时退出，也记录时间和磁盘占用
 if [ -z "$migration_end_time" ]; then
     migration_end_time=$(date +%s)
     migration_duration=$((migration_end_time - migration_start_time))
     echo "数据迁移阶段结束时间: $(date)"
     echo "数据迁移耗时: ${migration_duration}秒 (可能未完全完成)"
+    
+    # 即使超时也统计目标数据库的磁盘占用
+    migrated_data_size=$(du -sh ./dbtest/migrateDB/db/ 2>/dev/null | cut -f1 || echo "0")
+    migrated_data_bytes=$(du -sb ./dbtest/migrateDB/db/ 2>/dev/null | cut -f1 || echo "0")
+    echo "当前迁移数据量: ${migrated_data_size}"
 fi
 
 echo "数据迁移阶段完成，开始一致性检查..."
@@ -394,6 +415,12 @@ if check_data_consistency; then
     echo "等待删除操作同步..."
     sleep 30
     
+    # 统计删除操作后的磁盘占用变化
+    after_del_source_size=$(du -sh ./dbtest/sourceDB/db/ 2>/dev/null | cut -f1 || echo "0")
+    after_del_migrate_size=$(du -sh ./dbtest/migrateDB/db/ 2>/dev/null | cut -f1 || echo "0")
+    echo "删除操作后源数据库: ${after_del_source_size}"
+    echo "删除操作后迁移数据库: ${after_del_migrate_size}"
+    
     echo "第六阶段: 最终数据一致性验证..."
     final_check_start_time=$(date +%s)
     
@@ -573,6 +600,39 @@ echo "  数据类型: SET, HSET, LPUSH, SADD, ZADD, XADD"
 if [ -n "$migration_duration" ] && [ $migration_duration -gt 0 ]; then
     migration_rate=$((6000000 / migration_duration))
     echo "  迁移速度: 约 ${migration_rate} 条/秒"
+fi
+echo ""
+echo "磁盘占用统计:"
+if [ -n "$initial_data_size" ]; then
+    echo "  初始数据(300万条): ${initial_data_size}"
+fi
+if [ -n "$total_source_data_size" ]; then
+    echo "  源数据库(600万条): ${total_source_data_size}"
+fi
+if [ -n "$migrated_data_size" ]; then
+    echo "  迁移后数据库: ${migrated_data_size}"
+fi
+
+# 计算数据压缩比和单条记录平均大小
+if [ -n "$total_source_data_bytes" ] && [ "$total_source_data_bytes" -gt 0 ]; then
+    avg_record_size=$((total_source_data_bytes / 6000000))
+    echo "  平均每条记录: ${avg_record_size} 字节"
+fi
+
+if [ -n "$total_source_data_bytes" ] && [ -n "$migrated_data_bytes" ] && [ "$migrated_data_bytes" -gt 0 ]; then
+    if [ "$total_source_data_bytes" -gt "$migrated_data_bytes" ]; then
+        compression_ratio=$(echo "scale=2; $total_source_data_bytes / $migrated_data_bytes" | bc 2>/dev/null || echo "N/A")
+        if [ "$compression_ratio" != "N/A" ]; then
+            echo "  数据压缩比: ${compression_ratio}:1"
+        fi
+    elif [ "$migrated_data_bytes" -gt "$total_source_data_bytes" ]; then
+        expansion_ratio=$(echo "scale=2; $migrated_data_bytes / $total_source_data_bytes" | bc 2>/dev/null || echo "N/A")
+        if [ "$expansion_ratio" != "N/A" ]; then
+            echo "  数据膨胀比: ${expansion_ratio}:1"
+        fi
+    else
+        echo "  数据大小: 相同"
+    fi
 fi
 echo ""
 
