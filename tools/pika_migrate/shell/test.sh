@@ -78,16 +78,30 @@ echo "✓ 第一轮写入操作全部完成"
 echo "启动迁移工具..."
 # start migrateDB
 ./dbtest/migrateDB/pika -c ./dbtest/migrateDB/pika.conf &
-migrate_pika_pid=$!
-echo "迁移工具PID: $migrate_pika_pid"
 sleep 20
 
-# 检查迁移工具是否正常启动
-if ! kill -0 $migrate_pika_pid 2>/dev/null; then
-    echo "❌ 迁移工具启动失败"
+# 检查迁移工具是否正常启动（通过端口检查）
+echo "检查迁移工具启动状态..."
+migrate_check_count=0
+max_migrate_checks=30
+
+while [ $migrate_check_count -lt $max_migrate_checks ]; do
+    if redis-cli -p 9251 ping >/dev/null 2>&1; then
+        echo "✓ 迁移工具启动成功"
+        break
+    fi
+    
+    migrate_check_count=$((migrate_check_count + 1))
+    echo "  等待迁移工具启动... ($migrate_check_count/$max_migrate_checks)"
+    sleep 2
+done
+
+if [ $migrate_check_count -ge $max_migrate_checks ]; then
+    echo "❌ 迁移工具启动失败或超时"
+    echo "检查日志文件："
+    tail -20 ./dbtest/migrateDB/log/pika.ERROR 2>/dev/null || echo "无错误日志"
     exit 1
 fi
-echo "✓ 迁移工具启动成功"
 
 echo "设置binlog保留数量..."
 redis-cli -p 9221 -c config set expire-logs-nums 10000
@@ -139,7 +153,46 @@ echo "所有迁移期间的写操作已完成"
 
 echo "=== 写入测试完成 ==="
 echo "等待数据同步完成..."
-sleep 30
+
+# 智能等待数据迁移完成
+echo "监控数据迁移进度..."
+migration_timeout=300  # 5分钟超时
+start_time=$(date +%s)
+last_check_time=0
+
+while true; do
+    current_time=$(date +%s)
+    elapsed=$((current_time - start_time))
+    
+    # 检查超时
+    if [ $elapsed -gt $migration_timeout ]; then
+        echo "⚠ 数据迁移等待超时 (${migration_timeout}秒)"
+        break
+    fi
+    
+    # 每10秒检查一次日志
+    if [ $((current_time - last_check_time)) -ge 10 ]; then
+        # 检查日志中是否有完成标志
+        if grep -q "Retransmit Finish" ./dbtest/migrateDB/log/pika.INFO 2>/dev/null; then
+            echo "✓ 检测到数据迁移完成标志"
+            sleep 5  # 额外等待5秒确保完全完成
+            break
+        fi
+        
+        # 检查是否有错误
+        if [ -f "./dbtest/migrateDB/log/pika.ERROR" ] && [ -s "./dbtest/migrateDB/log/pika.ERROR" ]; then
+            echo "⚠ 检测到错误日志，请检查:"
+            tail -5 ./dbtest/migrateDB/log/pika.ERROR
+        fi
+        
+        echo "  数据迁移进行中... (已等待 ${elapsed}秒)"
+        last_check_time=$current_time
+    fi
+    
+    sleep 5
+done
+
+echo "数据迁移阶段完成，开始一致性检查..."
 
 echo "开始数据一致性检查..."
 
