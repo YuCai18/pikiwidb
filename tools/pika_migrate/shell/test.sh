@@ -56,24 +56,39 @@ sleep 20
 
 echo "开始写入测试数据..."
 ./consistency_benchmark -mp 9221 -d 60 -r 60 -n 500000 -log-file SET-12345.log SET __key__ __data__ &
+set1_pid=$!
 ./consistency_benchmark -mp 9221 -d 59 -r 59 -n 500000 -log-file HSET-12345.log HSET __key__ __key__ __data__ & 
+hset1_pid=$!
 ./consistency_benchmark -mp 9221 -d 58 -r 58 -n 500000 -log-file LPUSH-12345.log LPUSH __key__ __key__ __key__ &
+lpush1_pid=$!
 ./consistency_benchmark -mp 9221 -d 57 -r 57 -n 500000 -log-file SADD-12345.log SADD __key__ __key__ __data__ &
+sadd1_pid=$!
 ./consistency_benchmark -mp 9221 -d 56 -r 56 -n 500000 -log-file ZADD-12345.log ZADD __key__ 10 __key__ 9 __key__ &
-./consistency_benchmark -mp 9221 -d 55 -r 55 -n 500000 -log-file XADD-12345.log XADD __key__ 1 __key__ __data__ 
+zadd1_pid=$!
+./consistency_benchmark -mp 9221 -d 55 -r 55 -n 500000 -log-file XADD-12345.log XADD __key__ 1 __key__ __data__ &
+xadd1_pid=$!
+
 echo "等待第一轮写入完成..."
-sleep 30
+wait $set1_pid $hset1_pid $lpush1_pid $sadd1_pid $zadd1_pid $xadd1_pid
+echo "✓ 第一轮写入操作全部完成"
 
 echo "开始第二轮写入..."
 ./consistency_benchmark -mp 9221 -d 60 -r 60 -n 500000 -random-seed 54321 -log-file SET-54321.log SET __key__ __data__ & 
+set2_pid=$!
 ./consistency_benchmark -mp 9221 -d 59 -r 59 -n 500000 -random-seed 54321 -log-file HSET-54321.log HSET __key__ __key__ __data__ & 
+hset2_pid=$!
 ./consistency_benchmark -mp 9221 -d 58 -r 58 -n 500000 -random-seed 54321 -log-file LPUSH-54321.log LPUSH __key__ __key__ __key__ &
+lpush2_pid=$!
 ./consistency_benchmark -mp 9221 -d 57 -r 57 -n 500000 -random-seed 54321 -log-file SADD-54321.log SADD __key__ __key__ __data__ &
+sadd2_pid=$!
 ./consistency_benchmark -mp 9221 -d 56 -r 56 -n 500000 -random-seed 54321 -log-file ZADD-54321.log ZADD __key__ 10 __key__ 9 __key__ &
-./consistency_benchmark -mp 9221 -d 55 -r 55 -n 500000 -random-seed 54321 -log-file XADD-54321.log XADD __key__ 1 __key__ __data__ __key__ __data__ 
+zadd2_pid=$!
+./consistency_benchmark -mp 9221 -d 55 -r 55 -n 500000 -random-seed 54321 -log-file XADD-54321.log XADD __key__ 1 __key__ __data__ __key__ __data__ &
+xadd2_pid=$!
 
 echo "等待第二轮写入完成..."
-sleep 30
+wait $set2_pid $hset2_pid $lpush2_pid $sadd2_pid $zadd2_pid $xadd2_pid
+echo "✓ 第二轮写入操作全部完成"
 
 echo "启动迁移工具..."
 # start migrateDB
@@ -93,14 +108,40 @@ sleep 10
 echo "开始迁移期间的写操作..."
 # continue write duration migrate
 ./consistency_benchmark -mp 9221 -d 60 -r 60 -n 500000 -random-seed 54321 -log-file DEL-54321.log DEL __key__ __data__ &
+del_pid=$!
 ./consistency_benchmark -mp 9221 -d 59 -r 59 -n 500000 -random-seed 54321 -log-file HDEL-54321.log HDEL __key__ __key__ __data__ &  
+hdel_pid=$!
 ./consistency_benchmark -mp 9221 -d 58 -r 58 -n 500000 -random-seed 54321 -log-file LPOP-54321.log LPOP __key__ __key__ __key__ &
+lpop_pid=$!
 ./consistency_benchmark -mp 9221 -d 57 -r 57 -n 500000 -random-seed 54321 -log-file SREM-54321.log SREM __key__ __key__ __data__ &
+srem_pid=$!
 ./consistency_benchmark -mp 9221 -d 56 -r 56 -n 500000 -random-seed 54321 -log-file ZREM-54321.log ZREM __key__ __key__ __key__ &
+zrem_pid=$!
 ./consistency_benchmark -mp 9221 -d 55 -r 55 -n 500000 -random-seed 54321 -log-file XDEL-54321.log XDEL __key__ 1 __key__ __data__ __key__ __data__ &
+xdel_pid=$!
 
 echo "等待迁移期间的写操作完成..."
-sleep 30
+
+# 等待所有后台进程完成
+echo "等待DEL操作完成..."
+wait $del_pid 2>/dev/null && echo "✓ DEL操作完成" || echo "⚠ DEL操作异常结束"
+
+echo "等待HDEL操作完成..."
+wait $hdel_pid 2>/dev/null && echo "✓ HDEL操作完成" || echo "⚠ HDEL操作异常结束"
+
+echo "等待LPOP操作完成..."
+wait $lpop_pid 2>/dev/null && echo "✓ LPOP操作完成" || echo "⚠ LPOP操作异常结束"
+
+echo "等待SREM操作完成..."
+wait $srem_pid 2>/dev/null && echo "✓ SREM操作完成" || echo "⚠ SREM操作异常结束"
+
+echo "等待ZREM操作完成..."
+wait $zrem_pid 2>/dev/null && echo "✓ ZREM操作完成" || echo "⚠ ZREM操作异常结束"
+
+echo "等待XDEL操作完成..."
+wait $xdel_pid 2>/dev/null && echo "✓ XDEL操作完成" || echo "⚠ XDEL操作异常结束"
+
+echo "所有迁移期间的写操作已完成"
 
 echo "=== 写入测试完成 ==="
 echo "等待数据同步完成..."
@@ -267,6 +308,30 @@ read -n 1
 
 echo "关闭服务..."
 
+# 清理可能遗留的后台进程
+cleanup_background_processes() {
+    echo "清理后台进程..."
+    
+    # 查找并终止所有 consistency_benchmark 进程
+    local pids=$(pgrep -f "consistency_benchmark" 2>/dev/null)
+    if [ -n "$pids" ]; then
+        echo "发现遗留的 consistency_benchmark 进程: $pids"
+        for pid in $pids; do
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "终止进程 $pid..."
+                kill -TERM "$pid" 2>/dev/null
+                sleep 2
+                if kill -0 "$pid" 2>/dev/null; then
+                    kill -KILL "$pid" 2>/dev/null
+                fi
+            fi
+        done
+        echo "✓ 后台进程清理完成"
+    else
+        echo "✓ 没有发现遗留的后台进程"
+    fi
+}
+
 shutdown_pika_service() {
     local port=$1
     local service_name=$2
@@ -347,6 +412,9 @@ shutdown_pika_service() {
     echo "  ⚠ 无法确认 $service_name 是否完全关闭"
     return 1
 }
+
+# 首先清理后台进程
+cleanup_background_processes
 
 # 关闭迁移工具 (端口 9251)
 shutdown_pika_service 9251 "迁移工具"
